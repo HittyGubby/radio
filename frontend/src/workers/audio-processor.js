@@ -1,7 +1,7 @@
 class AudioProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.sampleRate = 48000;
+    this.sampleRate = 24000;
     this.audioBuffer = new Float32Array(0);
     this.bufferPosition = 0;
     this.totalProcessed = 0;

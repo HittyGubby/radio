@@ -142,7 +142,7 @@ pub async fn start_audio_capture(
 
             let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
             audio_info.set_format(pw::spa::param::audio::AudioFormat::F32LE);
-            audio_info.set_rate(config.sample_rate);
+            audio_info.set_rate(config.get_input_sample_rate());
             audio_info.set_channels(config.channels as u32);
 
             let obj = pw::spa::pod::Object {

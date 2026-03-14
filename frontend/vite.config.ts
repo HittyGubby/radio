@@ -12,6 +12,11 @@ export default defineConfig({
         rewrite: () => '/audio',
         ws: true,
       },
+      '/spectro': {
+        target: 'ws://127.0.0.1:23331',
+        rewrite: () => '/spectro',
+        ws: true,
+      },
       '/config': {
         target: 'http://127.0.0.1:23331',
         rewrite: () => '/config',

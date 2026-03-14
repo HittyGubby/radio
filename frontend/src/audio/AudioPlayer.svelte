@@ -8,13 +8,15 @@
   const dispatch = createEventDispatcher();
 
   interface AudioConfig {
-    sample_rate: number;
+    output_sample_rate: number;
     audio_bitrate: number;
     jitter_buffer_ms: number;
+    input_sample_rate: number;
   }
 
   let audioConfig: AudioConfig | null = null;
-  let SAMPLE_RATE = 48000;
+  let OUTPUT_SAMPLE_RATE = 0; // Sample rate for encoded audio (from server)
+  let ACTUAL_SAMPLE_RATE = 0; // Actual AudioContext sample rate (may differ)
 
   let audioContext: AudioContext | null = null;
   let analyserNode: AnalyserNode | null = null;
@@ -25,8 +27,8 @@
   let workletNode: any = null;
   let feedIntervalId: number | null = null;
 
-  let JITTER_BUFFER_SAMPLES = (SAMPLE_RATE * 100) / 1000;
-  let MIN_BUFFER_SAMPLES = (SAMPLE_RATE * 50) / 1000;
+  let JITTER_BUFFER_SAMPLES = 0; // Will be calculated after config is fetched
+  let MIN_BUFFER_SAMPLES = 0; // Will be calculated after config is fetched
   let jitterBuffer: Float32Array = new Float32Array(JITTER_BUFFER_SAMPLES);
   let jitterBufferWritePos = 0;
   let jitterBufferReadPos = 0;
@@ -45,10 +47,11 @@
       }
       const config = (await response.json()) as AudioConfig;
       audioConfig = config;
-      SAMPLE_RATE = config.sample_rate;
-      JITTER_BUFFER_SAMPLES = (SAMPLE_RATE * config.jitter_buffer_ms) / 1000;
-      MIN_BUFFER_SAMPLES = (SAMPLE_RATE * (config.jitter_buffer_ms / 2)) / 1000;
+      OUTPUT_SAMPLE_RATE = config.output_sample_rate;
+      JITTER_BUFFER_SAMPLES = (OUTPUT_SAMPLE_RATE * config.jitter_buffer_ms) / 1000;
+      MIN_BUFFER_SAMPLES = (OUTPUT_SAMPLE_RATE * (config.jitter_buffer_ms / 2)) / 1000;
       jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
+      console.log("Audio config loaded - Output sample rate:", OUTPUT_SAMPLE_RATE, "Input sample rate:", config.input_sample_rate);
     } catch (e) {
       console.error("Failed to fetch audio config:", e);
     }
@@ -82,7 +85,7 @@
   async function initOpusDecoder() {
     try {
       opusDecoder = new OpusDecoder({
-        sampleRate: SAMPLE_RATE as any,
+        sampleRate: OUTPUT_SAMPLE_RATE as any,
         channels: 1,
       });
       await opusDecoder.ready;
@@ -95,12 +98,44 @@
   }
 
   async function initAudioContext() {
-    audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
-      sampleRate: SAMPLE_RATE,
-    });
+    // Ensure we have a valid sample rate from config
+    if (OUTPUT_SAMPLE_RATE === 0) {
+      console.error("Output sample rate not set, cannot initialize AudioContext");
+      return;
+    }
+
+    // Mobile compatibility: Try to use the system's preferred sample rate
+    // Some mobile devices don't support custom sample rates
+    const contextOptions: AudioContextOptions = {};
+
+    // On mobile, it's better to let the browser choose the sample rate
+    // iOS and Android have different preferred rates (44.1kHz or 48kHz)
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+    if (!isMobile) {
+      // Only force sample rate on desktop
+      contextOptions.sampleRate = OUTPUT_SAMPLE_RATE;
+    }
+
+    audioContext = new (window.AudioContext || (window as any).webkitAudioContext)(contextOptions);
+
+    // Store the actual AudioContext sample rate (may differ from OUTPUT_SAMPLE_RATE)
+    ACTUAL_SAMPLE_RATE = audioContext.sampleRate;
+    console.log("Audio context created - Output sample rate:", OUTPUT_SAMPLE_RATE, "Actual context sample rate:", ACTUAL_SAMPLE_RATE);
+
+    // Mobile compatibility: Adjust jitter buffer for higher latency on mobile
+    // Android can have 300ms+ latency, iOS typically better but still significant
+    const latencyMultiplier = isMobile ? 2.0 : 1.0;
+    const jitterBufferMs = audioConfig?.jitter_buffer_ms || 200;
+    JITTER_BUFFER_SAMPLES = Math.floor((OUTPUT_SAMPLE_RATE * jitterBufferMs * latencyMultiplier) / 1000);
+    MIN_BUFFER_SAMPLES = Math.floor(JITTER_BUFFER_SAMPLES / 2);
+    jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
+
+    // Mobile compatibility: Use larger FFT size for better performance on slower devices
+    const mobileFFTSize = isMobile ? 4096 : 1024;
 
     analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 1024;
+    analyserNode.fftSize = mobileFFTSize;
     analyserNode.smoothingTimeConstant = 0.0;
     analyserNode.minDecibels = -100;
     analyserNode.maxDecibels = 0;
@@ -109,8 +144,12 @@
       await audioContext.resume();
     }
 
-    try {
-      if (audioContext.audioWorklet) {
+    // Mobile compatibility: Prefer ScriptProcessor on mobile for better stability
+    // AudioWorklet can have issues with low latency (128 samples) causing distortion
+    if (isMobile || !audioContext.audioWorklet) {
+      initScriptProcessor();
+    } else {
+      try {
         await audioContext.audioWorklet.addModule(new URL("../workers/audio-processor.js", import.meta.url));
 
         workletNode = new AudioWorkletNode(audioContext, "audio-processor", {
@@ -128,12 +167,10 @@
 
         dispatch("audioContextReady", audioContext);
         startContinuousFeeding();
-      } else {
+      } catch (e) {
+        console.error("Failed to initialize AudioWorklet:", e);
         initScriptProcessor();
       }
-    } catch (e) {
-      console.error("Failed to initialize AudioWorklet:", e);
-      initScriptProcessor();
     }
   }
 
@@ -230,6 +267,11 @@
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
+      }
+
+      // Resume audio context when WebSocket reconnects
+      if (audioContext && audioContext.state === "suspended") {
+        audioContext.resume();
       }
     };
 
@@ -357,8 +399,9 @@
 
   export function getAudioStats() {
     return {
-      sampleRate: SAMPLE_RATE,
-      bitrate: audioConfig?.audio_bitrate || 48000,
+      sampleRate: OUTPUT_SAMPLE_RATE,
+      actualSampleRate: ACTUAL_SAMPLE_RATE,
+      bitrate: audioConfig?.audio_bitrate || 0,
       jitterBufferSamples: getAvailableSamples(),
       jitterBufferCapacity: JITTER_BUFFER_SAMPLES,
       wsConnected: ws !== null && ws.readyState === WebSocket.OPEN,

@@ -2,13 +2,14 @@ mod audio_input;
 mod config;
 mod encoder;
 mod pipewire_devices;
+mod spectrogram_processor;
+mod spectrogram_ws;
 mod ws_router;
 
 use audio_input::start_audio_capture;
-use clap::Parser;
 use config::Config;
 use encoder::run_encoder;
-use log::error;
+use log::{error, info};
 use std::sync::Arc;
 use tokio::signal;
 use ws_router::run_ws_server;
@@ -19,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    let config = Config::parse();
+    let config = Config::load();
 
     if config.list_devices {
         let devices = pipewire_devices::list_audio_devices().await?;
@@ -57,8 +58,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (audio_samples_tx, _) = tokio::sync::broadcast::channel(1000);
     let (audio_tx, _) = tokio::sync::broadcast::channel(200);
+    let (spectro_tx, _) = tokio::sync::broadcast::channel::<spectrogram_ws::SpectrogramPacket>(500);
+    let spectro_tx_for_task = spectro_tx.clone();
 
     let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spectro_client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let audio_capture_handle = start_audio_capture(&config, audio_samples_tx.clone()).await?;
     log::info!("Audio capture started");
@@ -81,15 +85,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let audio_history = Arc::new(tokio::sync::Mutex::new(ws_router::AudioHistory::new(
-        config.sample_rate,
+        config.get_input_sample_rate(),
         2,
     )));
+
+    let spectro_history = Arc::new(tokio::sync::Mutex::new(ws_router::SpectroHistory::new(500)));
 
     let ws_shutdown = shutdown.clone();
     let ws_config = config.clone();
     let ws_audio_rx = audio_tx.subscribe();
     let ws_audio_history = audio_history.clone();
     let ws_client_count = client_count.clone();
+    let ws_spectro_history = spectro_history.clone();
 
     let ws_task = tokio::spawn(async move {
         run_ws_server(
@@ -98,6 +105,9 @@ async fn main() -> anyhow::Result<()> {
             ws_audio_history,
             ws_shutdown,
             ws_client_count,
+            Some(spectro_tx_for_task.subscribe()),
+            Some(spectro_client_count.clone()),
+            Some(ws_spectro_history),
         )
         .await
     });
@@ -124,18 +134,139 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Spectrogram history task
+    let spectro_history_task_shutdown = shutdown.clone();
+    let mut spectro_history_task_rx = spectro_tx.subscribe();
+    let spectro_history_task_history = spectro_history.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = spectro_history_task_shutdown.notified() => {
+                    break;
+                }
+                result = spectro_history_task_rx.recv() => {
+                    if let Ok(packet) = result {
+                        spectro_history_task_history.lock().await.add(packet);
+                    }
+                }
+            }
+        }
+    });
+
+    // Spectrogram processing task
+    let spectro_shutdown = shutdown.clone();
+    let spectro_config = config.clone();
+    let mut spectro_audio_rx = audio_samples_tx.subscribe();
+    let spectro_tx_clone = spectro_tx.clone();
+
+    let _spectro_task = tokio::spawn(async move {
+        use spectrogram_processor::SpectrogramProcessor;
+        use std::time::{Duration, Instant};
+
+        let mut processor = match SpectrogramProcessor::new(&spectro_config) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to create spectrogram processor: {}", e);
+                return;
+            }
+        };
+
+        // Calculate the ratio between input and output sample rates
+        // This determines how many spectrogram frames to pack into each packet
+        let input_rate = spectro_config.get_input_sample_rate();
+        let output_rate = spectro_config.get_output_sample_rate();
+        let frames_per_packet = if input_rate > output_rate {
+            (input_rate / output_rate).max(1) as usize
+        } else {
+            1
+        };
+
+        info!("Spectrogram: input_rate={}, output_rate={}, frames_per_packet={}", input_rate, output_rate, frames_per_packet);
+
+        let mut sample_buffer: Vec<f32> = Vec::new();
+        let target_samples = spectro_config.spectro_frame_samples();
+        let input_frame_interval = Duration::from_millis(spectro_config.spectro_frame_ms as u64);
+        let output_frame_interval = Duration::from_millis((spectro_config.spectro_frame_ms * frames_per_packet) as u64);
+        let mut last_input_frame_time = Instant::now();
+        let mut last_output_frame_time = Instant::now();
+        let start_time = Instant::now();
+        let mut accumulated_frames: Vec<Vec<u8>> = Vec::new();
+
+        loop {
+            tokio::select! {
+                _ = spectro_shutdown.notified() => {
+                    break;
+                }
+                result = spectro_audio_rx.recv() => {
+                    if let Ok(samples) = result {
+                        sample_buffer.extend(samples.iter());
+
+                        // Check if we have enough samples for a frame
+                        if sample_buffer.len() >= target_samples {
+                            // Rate limiting - only process at input frame interval
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(last_input_frame_time);
+
+                            if elapsed >= input_frame_interval {
+                                // Take samples for processing
+                                let frame_samples: Vec<f32> = sample_buffer.drain(..target_samples).collect();
+
+                                // Process FFT
+                                let frequency_data = processor.process(&frame_samples);
+                                accumulated_frames.push(frequency_data);
+
+                                last_input_frame_time = now;
+                            }
+                        }
+
+                        // Keep buffer from growing too large
+                        if sample_buffer.len() > target_samples * 2 {
+                            let excess = sample_buffer.len() - target_samples;
+                            sample_buffer.drain(0..excess);
+                        }
+
+                        // Check if we have enough frames to send a packet
+                        let now = Instant::now();
+                        let elapsed_output = now.duration_since(last_output_frame_time);
+
+                        if accumulated_frames.len() >= frames_per_packet || (elapsed_output >= output_frame_interval && !accumulated_frames.is_empty()) {
+                            // Create spectrogram packet with accumulated frames
+                            let packet = spectrogram_ws::SpectrogramPacket::new_with_frames(
+                                start_time.elapsed().as_millis() as u64,
+                                accumulated_frames.clone(),
+                            );
+
+                            // Send to clients
+                            if let Err(_) = spectro_tx_clone.send(packet) {
+                                // No spectrogram clients connected
+                            }
+
+                            accumulated_frames.clear();
+                            last_output_frame_time = now;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let _capture_handle = audio_capture_handle;
 
     tokio::select! {
-        _ = shutdown.notified() => {}
+        _ = shutdown.notified() => {
+            info!("Shutdown signal received");
+        }
         result = encoder_task => {
-            if let Err(e) = result {
-                error!("Encoder task error: {}", e);
+            match result {
+                Ok(_) => info!("Encoder task completed"),
+                Err(e) => error!("Encoder task error: {}", e),
             }
         }
         result = ws_task => {
-            if let Err(e) = result {
-                error!("WebSocket server task error: {}", e);
+            match result {
+                Ok(_) => info!("WebSocket server task completed"),
+                Err(e) => error!("WebSocket server task error: {}", e),
             }
         }
     }

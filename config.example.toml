@@ -1,0 +1,48 @@
+# Radio Backend Configuration Example
+# Copy this file to:
+#   Linux:   ~/.config/radio/config.toml
+#   macOS:   ~/Library/Application Support/radio/config.toml
+#   Windows: %APPDATA%\radio\config.toml
+
+# Audio input device selection (specify only one)
+# device_name = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+# device_id = 0
+
+# Audio parameters
+input_sample_rate = 48000
+output_sample_rate = 12000
+channels = 1
+audio_codec = "opus"
+audio_bitrate = 24000
+audio_bitdepth = 16
+audio_frame_ms = 50
+ring_buffer_seconds = 10
+jitter_buffer_ms = 500
+
+# WebSocket server settings
+ws_bind = "[::]:23331"
+audio_path = "/audio"
+config_path = "/config"
+
+# Client limits
+max_clients = 200
+
+# Spectrogram settings
+spectro_enabled = true
+spectro_path = "/spectro"
+spectro_fft_size = 8192
+spectro_max_freq = 16000
+spectro_window = "hann"
+spectro_smoothing = 0
+spectro_min_db = -100
+spectro_max_db = 0
+spectro_frame_ms = 50
+
+# Notes:
+# - All values can be overridden via command-line arguments
+# - Command-line args have higher priority than config file
+# - Window function options: hann, hamming, blackman
+# - spectro_fft_size must be a power of 2 (256, 512, 1024, 2048, 4096, 8192, etc.)
+# - spectro_max_freq cannot exceed input_sample_rate / 2 (Nyquist frequency)
+# - input_sample_rate: Sample rate for audio capture and spectrogram
+# - output_sample_rate: Sample rate for encoded audio transmission (lower = less bandwidth)

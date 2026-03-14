@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import Spectrogram from "./spectrogram/Spectrogram.svelte";
+  import SpectrogramDrawer from "./spectrogram/SpectrogramDrawer.svelte";
   import AudioPlayer from "./audio/AudioPlayer.svelte";
   import Metadata, { type SongMetadata } from "./metadata/Metadata.svelte";
   import AudioPanel from "./components/AudioPanel.svelte";
@@ -20,7 +20,6 @@
 
   let playerProgress: number = 0;
   let audioContext: AudioContext | null = null;
-  let analyserNode: AnalyserNode | null = null;
   let isMobile: boolean = false;
   let audioPacketPerSec: number = 0;
   let audioBufferSamples: number = 0;
@@ -39,7 +38,6 @@
 
   function handleAudioContextReady(context: AudioContext) {
     audioContext = context;
-    analyserNode = audioPlayerComponent.getAnalyserNode?.() || null;
   }
 
   function updateDebugData() {
@@ -59,7 +57,7 @@
 </script>
 
 <main>
-  <Spectrogram {analyserNode} />
+  <SpectrogramDrawer />
   <AudioPlayer bind:this={audioPlayerComponent} on:audioContextReady={(e) => handleAudioContextReady(e.detail)} />
   <Metadata bind:metadata bind:playerProgress onSongChange={handleSongChange} />
 
