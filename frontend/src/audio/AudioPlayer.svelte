@@ -1,42 +1,26 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { OpusDecoder } from "opus-decoder";
+  import { createEventDispatcher } from "svelte";
 
   const WS_URL = "/audio";
   const CONFIG_URL = "/config";
+  const dispatch = createEventDispatcher();
 
   interface AudioConfig {
-    list_devices: boolean;
-    device_name: string | null;
-    device_id: number | null;
     sample_rate: number;
-    channels: number;
-    ring_buffer_seconds: number;
-    audio_codec: string;
     audio_bitrate: number;
-    audio_bitdepth: number;
-    audio_frame_ms: number;
-    fft_size: number;
-    fft_overlap: number;
-    spectro_bins: number;
-    spectro_fps: number;
-    ws_bind: string;
-    audio_path: string;
-    spectro_path: string;
-    max_clients: number;
     jitter_buffer_ms: number;
   }
 
   let audioConfig: AudioConfig | null = null;
   let SAMPLE_RATE = 48000;
-  let USE_OPUS = true;
-  let BIT_DEPTH = 16;
 
   let audioContext: AudioContext | null = null;
+  let analyserNode: AnalyserNode | null = null;
   let ws: WebSocket | null = null;
   let reconnectTimer: number | null = null;
-  let packetCount: number = 0;
-  let latency: number = 0;
+  let packetTimestamps: number[] = [];
   let opusDecoder: any = null;
   let workletNode: any = null;
   let feedIntervalId: number | null = null;
@@ -53,8 +37,6 @@
   let opusDecodeErrors = 0;
   let opusDecoderReady = false;
 
-  export let onLatencyUpdate: (latency: number) => void = () => {};
-
   async function fetchAudioConfig() {
     try {
       const response = await fetch(CONFIG_URL);
@@ -64,51 +46,18 @@
       const config = (await response.json()) as AudioConfig;
       audioConfig = config;
       SAMPLE_RATE = config.sample_rate;
-      USE_OPUS = config.audio_codec === "opus";
-      BIT_DEPTH = config.audio_bitdepth;
-
       JITTER_BUFFER_SAMPLES = (SAMPLE_RATE * config.jitter_buffer_ms) / 1000;
       MIN_BUFFER_SAMPLES = (SAMPLE_RATE * (config.jitter_buffer_ms / 2)) / 1000;
       jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
     } catch (e) {
       console.error("Failed to fetch audio config:", e);
-      audioConfig = {
-        sample_rate: 48000,
-        channels: 1,
-        audio_codec: "opus",
-        audio_bitrate: 48000,
-        audio_bitdepth: 16,
-        audio_frame_ms: 20,
-        jitter_buffer_ms: 100,
-        list_devices: false,
-        device_name: null,
-        device_id: null,
-        ring_buffer_seconds: 10,
-        fft_size: 1024,
-        fft_overlap: 0.5,
-        spectro_bins: 512,
-        spectro_fps: 25,
-        ws_bind: "[::]:23331",
-        audio_path: "/audio",
-        spectro_path: "/spectro",
-        max_clients: 200,
-      };
-      SAMPLE_RATE = audioConfig.sample_rate;
-      USE_OPUS = audioConfig.audio_codec === "opus";
-      BIT_DEPTH = audioConfig.audio_bitdepth;
-
-      JITTER_BUFFER_SAMPLES = (SAMPLE_RATE * audioConfig.jitter_buffer_ms) / 1000;
-      MIN_BUFFER_SAMPLES = (SAMPLE_RATE * (audioConfig.jitter_buffer_ms / 2)) / 1000;
-      jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
     }
   }
 
   onMount(async () => {
     await fetchAudioConfig();
     initAudioContext();
-    if (USE_OPUS) {
-      initOpusDecoder();
-    }
+    initOpusDecoder();
     connectWebSocket();
   });
 
@@ -150,27 +99,38 @@
       sampleRate: SAMPLE_RATE,
     });
 
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 1024;
+    analyserNode.smoothingTimeConstant = 0.0;
+    analyserNode.minDecibels = -100;
+    analyserNode.maxDecibels = 0;
+
     if (audioContext.state === "suspended") {
       await audioContext.resume();
     }
 
     try {
-      await audioContext.audioWorklet.addModule("/src/audio/audio-processor.js");
-      workletNode = new AudioWorkletNode(audioContext, "audio-processor", {
-        outputChannelCount: [1],
-      });
+      if (audioContext.audioWorklet) {
+        await audioContext.audioWorklet.addModule(new URL("../workers/audio-processor.js", import.meta.url));
 
-      workletNode.connect(audioContext.destination);
+        workletNode = new AudioWorkletNode(audioContext, "audio-processor", {
+          outputChannelCount: [1],
+        });
 
-      workletNode.port.onmessage = (event: MessageEvent) => {
-        if (event.data.type === "stats") {
-          lastReportedTotalProcessed = event.data.totalProcessed;
-          latency = parseFloat(event.data.bufferMs);
-          onLatencyUpdate(latency);
-        }
-      };
+        workletNode.connect(analyserNode);
+        analyserNode.connect(audioContext.destination);
 
-      startContinuousFeeding();
+        workletNode.port.onmessage = (event: MessageEvent) => {
+          if (event.data.type === "stats") {
+            lastReportedTotalProcessed = event.data.totalProcessed;
+          }
+        };
+
+        dispatch("audioContextReady", audioContext);
+        startContinuousFeeding();
+      } else {
+        initScriptProcessor();
+      }
     } catch (e) {
       console.error("Failed to initialize AudioWorklet:", e);
       initScriptProcessor();
@@ -199,16 +159,15 @@
       } else {
         audioBuffer = new Float32Array(0);
       }
-
-      latency = (audioBuffer.length / SAMPLE_RATE) * 1000;
-      onLatencyUpdate(latency);
     };
 
-    scriptProcessor.connect(audioContext!.destination);
+    scriptProcessor.connect(analyserNode!);
+    analyserNode!.connect(audioContext!.destination);
     workletNode = scriptProcessor;
 
     (workletNode as any).audioBuffer = audioBuffer;
 
+    dispatch("audioContextReady", audioContext);
     startContinuousFeeding();
   }
 
@@ -264,10 +223,9 @@
   function connectWebSocket() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    ws = new WebSocket(`${protocol}//${host}${WS_URL}`);
-
+    const wsUrl = `${protocol}//${host}${WS_URL}`;
+    ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
-
     ws.onopen = () => {
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
@@ -281,7 +239,11 @@
       const payload = new Uint8Array(event.data, 8);
 
       await queueAudioPacket(payload, timestamp);
-      packetCount++;
+      packetTimestamps.push(Date.now());
+
+      // Keep only timestamps from the last 5 seconds (sliding window)
+      const now = Date.now();
+      packetTimestamps = packetTimestamps.filter((ts) => now - ts < 1000);
     };
 
     ws.onerror = (error) => {
@@ -297,43 +259,30 @@
   async function queueAudioPacket(payload: Uint8Array, timestamp: number) {
     if (!audioContext) return;
 
-    let samples: Float32Array;
+    let samples: Float32Array = new Float32Array(0);
 
-    if (USE_OPUS) {
-      if (!opusDecoder || !opusDecoderReady) {
+    if (!opusDecoder || !opusDecoderReady) {
+      opusDecoder = null;
+      opusDecoderReady = false;
+      await initOpusDecoder();
+    }
+
+    if (opusDecoder && opusDecoderReady) {
+      try {
+        if (payload.length === 0) {
+          throw new Error("Empty payload");
+        }
+
+        const result = opusDecoder.decodeFrame(payload);
+        samples = result.channelData[0];
+        opusDecodeErrors = 0;
+      } catch (e) {
+        opusDecodeErrors++;
+        console.error(`Opus decode error (${opusDecodeErrors}), payload size: ${payload.length}:`, e);
+
         opusDecoder = null;
         opusDecoderReady = false;
-        await initOpusDecoder();
       }
-
-      if (opusDecoder && opusDecoderReady) {
-        try {
-          if (payload.length === 0) {
-            throw new Error("Empty payload");
-          }
-
-          const result = opusDecoder.decodeFrame(payload);
-          samples = result.channelData[0];
-          opusDecodeErrors = 0;
-        } catch (e) {
-          opusDecodeErrors++;
-          console.error(`Opus decode error (${opusDecodeErrors}), payload size: ${payload.length}:`, e);
-
-          if (opusDecodeErrors > 5) {
-            console.error("Too many Opus decode errors, disabling Opus and using PCM");
-            USE_OPUS = false;
-          }
-
-          opusDecoder = null;
-          opusDecoderReady = false;
-
-          samples = decodePCM(payload);
-        }
-      } else {
-        samples = decodePCM(payload);
-      }
-    } else {
-      samples = decodePCM(payload);
     }
 
     addToJitterBuffer(samples);
@@ -357,36 +306,6 @@
     }
   }
 
-  function decodePCM(payload: Uint8Array): Float32Array {
-    let samples: Float32Array;
-
-    if (BIT_DEPTH === 16) {
-      const sampleCount = payload.length / 2;
-      samples = new Float32Array(sampleCount);
-
-      for (let i = 0; i < sampleCount; i++) {
-        const sample = new DataView(payload.buffer, i * 2, 2).getInt16(0, true);
-        samples[i] = sample / 32768.0;
-      }
-    } else if (BIT_DEPTH === 24) {
-      const sampleCount = payload.length / 3;
-      samples = new Float32Array(sampleCount);
-
-      for (let i = 0; i < sampleCount; i++) {
-        const byte1 = payload[i * 3];
-        const byte2 = payload[i * 3 + 1];
-        const byte3 = payload[i * 3 + 2];
-        const sample = (byte1 | (byte2 << 8) | (byte3 << 16));
-        const signed = sample > 8388607 ? sample - 16777216 : sample;
-        samples[i] = signed / 8388608.0;
-      }
-    } else {
-      throw new Error(`Unsupported bit depth: ${BIT_DEPTH}`);
-    }
-
-    return samples;
-  }
-
   function scheduleReconnect() {
     if (reconnectTimer) return;
 
@@ -402,6 +321,7 @@
     playbackStarted = false;
     samplesFedToWorklet = 0;
     lastReportedTotalProcessed = 0;
+    packetTimestamps = [];
 
     if (workletNode && workletNode.port) {
       workletNode.port.postMessage({ type: "clear" });
@@ -416,12 +336,17 @@
     }, 1000);
   }
 
-  export function getPacketsPerSecond(): number {
-    return packetCount;
+  export function getPacketPerSec(): number {
+    if (packetTimestamps.length === 0) return 0;
+    const now = Date.now();
+    const oldestTimestamp = packetTimestamps[0];
+    const timeWindowSeconds = (now - oldestTimestamp) / 1000;
+    if (timeWindowSeconds === 0) return packetTimestamps.length;
+    return (packetTimestamps.length / timeWindowSeconds).toFixed(2) as unknown as number;
   }
 
-  export function resetPacketCount() {
-    packetCount = 0;
+  export function getAnalyserNode(): AnalyserNode | null {
+    return analyserNode;
   }
 
   export async function resumeAudio() {
@@ -429,8 +354,15 @@
       await audioContext.resume();
     }
   }
-</script>
 
-<svelte:head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-</svelte:head>
+  export function getAudioStats() {
+    return {
+      sampleRate: SAMPLE_RATE,
+      bitrate: audioConfig?.audio_bitrate || 48000,
+      jitterBufferSamples: getAvailableSamples(),
+      jitterBufferCapacity: JITTER_BUFFER_SAMPLES,
+      wsConnected: ws !== null && ws.readyState === WebSocket.OPEN,
+      playbackStarted: playbackStarted,
+    };
+  }
+</script>

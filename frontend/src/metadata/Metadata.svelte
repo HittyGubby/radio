@@ -20,6 +20,39 @@
     return lyrics;
   }
 
+  export interface MergedLyricLine {
+    time: number;
+    text: string;
+    translation: string | null;
+  }
+
+  export function mergeLyricsAndTranslation(lyricText: string, tlyricText: string): MergedLyricLine[] {
+    const lyrics = parseLyrics(lyricText);
+    const translations = parseLyrics(tlyricText);
+
+    const merged: MergedLyricLine[] = [];
+
+    // Create a map of translations by time for quick lookup
+    const translationMap = new Map<number, string>();
+    for (const t of translations) {
+      translationMap.set(t.time, t.text);
+    }
+
+    // Merge lyrics with their translations
+    for (const l of lyrics) {
+      merged.push({
+        time: l.time,
+        text: l.text,
+        translation: translationMap.get(l.time) || null,
+      });
+    }
+
+    // Sort by time
+    merged.sort((a, b) => a.time - b.time);
+
+    return merged;
+  }
+
   export interface SongMetadata {
     status: string;
     name: string;
@@ -28,19 +61,18 @@
     picUrl: string;
     progress: number;
     duration: number;
-    playbackRate: number;
     lyric: string;
     tlyric: string;
   }
 </script>
 
 <script lang="ts">
-  const INFO_URL = "/info";
   const STATUS_URL = "/status";
 
   let eventSource: EventSource | null = null;
   let reconnectTimer: number | null = null;
   let isRefreshing = false;
+  let metadataWorker: Worker | null = null;
 
   export let metadata: SongMetadata = {
     status: "",
@@ -50,22 +82,41 @@
     picUrl: "",
     progress: 0,
     duration: 0,
-    playbackRate: 1,
     lyric: "",
     tlyric: "",
   };
 
   export let playerProgress: number = 0;
   export let onSongChange: () => void = () => {};
-  export let onStateChange: (progress: number) => void = () => {};
 
   onMount(() => {
-    fetchMetadata();
-    setTimeout(() => {
-      if (!eventSource) {
-        connectSSE();
+    // Initialize metadata worker
+    metadataWorker = new Worker(new URL("../workers/metadata-worker.js", import.meta.url));
+    metadataWorker.onmessage = (e) => {
+      if (e.data.type === "success") {
+        const newMetadata: SongMetadata = e.data.data;
+        // Check if song changed BEFORE updating metadata
+        const songChanged = newMetadata.name !== metadata.name ||
+                           newMetadata.singer !== metadata.singer ||
+                           newMetadata.albumName !== metadata.albumName;
+
+        metadata = newMetadata;
+
+        if (songChanged) {
+          onSongChange();
+        }
+
+        isRefreshing = false;
+      } else if (e.data.type === "error") {
+        console.error("Failed to fetch metadata:", e.data.error);
+        isRefreshing = false;
       }
-    }, 2000);
+    };
+
+    fetchMetadata();
+    if (!eventSource) {
+      connectSSE();
+    }
   });
 
   onDestroy(() => {
@@ -75,27 +126,15 @@
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
     }
+    if (metadataWorker) {
+      metadataWorker.terminate();
+    }
   });
 
-  async function fetchMetadata() {
-    if (isRefreshing) return;
+  function fetchMetadata() {
+    if (isRefreshing || !metadataWorker) return;
     isRefreshing = true;
-
-    try {
-      const response = await fetch(INFO_URL);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const newMetadata: SongMetadata = await response.json();
-      if (newMetadata.name !== metadata.name || newMetadata.singer !== metadata.singer || newMetadata.albumName !== metadata.albumName) {
-        onSongChange();
-      }
-      metadata = newMetadata;
-    } catch (error) {
-      console.error("Failed to fetch metadata:", error);
-    } finally {
-      isRefreshing = false;
-    }
+    metadataWorker.postMessage({ type: "fetch" });
   }
 
   function connectSSE() {
@@ -113,11 +152,13 @@
           const progress = parseFloat(event.data);
           playerProgress = progress;
           if (metadata.duration > 0 && progress >= metadata.duration) {
-            fetchMetadata();
+            setTimeout(() => fetchMetadata(), 200);
           }
-          onStateChange(progress);
         } else {
-          fetchMetadata();
+          // Trigger onSongChange immediately for song changes
+          onSongChange();
+          // Fetch metadata after 200ms delay to give API time to be ready
+          setTimeout(() => fetchMetadata(), 200);
         }
       });
     }
@@ -134,6 +175,6 @@
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectSSE();
-    }, 5000);
+    }, 3000);
   }
 </script>

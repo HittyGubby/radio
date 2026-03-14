@@ -45,22 +45,6 @@ pub struct Config {
     #[arg(long, default_value = "20")]
     pub audio_frame_ms: usize,
 
-    /// FFT size (must be power of 2)
-    #[arg(long, default_value = "1024")]
-    pub fft_size: usize,
-
-    /// FFT overlap ratio (0.0 to 1.0)
-    #[arg(long, default_value = "0.5")]
-    pub fft_overlap: f64,
-
-    /// Number of spectrogram bins (display resolution)
-    #[arg(long, default_value = "512")]
-    pub spectro_bins: usize,
-
-    /// Spectrogram frames per second
-    #[arg(long, default_value = "25")]
-    pub spectro_fps: usize,
-
     /// WebSocket bind address
     #[arg(long, default_value = "[::]:23331")]
     pub ws_bind: String,
@@ -68,10 +52,6 @@ pub struct Config {
     /// WebSocket audio endpoint path
     #[arg(long, default_value = "/audio")]
     pub audio_path: String,
-
-    /// WebSocket spectrogram endpoint path
-    #[arg(long, default_value = "/spectro")]
-    pub spectro_path: String,
 
     /// Config endpoint path
     #[arg(long, default_value = "/config")]
@@ -91,32 +71,12 @@ impl Config {
         (self.sample_rate as usize * self.audio_frame_ms) / 1000
     }
 
-    pub fn fft_step(&self) -> usize {
-        (self.fft_size as f64 * (1.0 - self.fft_overlap)) as usize
-    }
-
-    pub fn spectro_interval_ms(&self) -> u64 {
-        1000 / self.spectro_fps as u64
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.fft_size & (self.fft_size - 1) != 0 {
-            anyhow::bail!("FFT size must be a power of 2");
-        }
-        if self.fft_overlap < 0.0 || self.fft_overlap >= 1.0 {
-            anyhow::bail!("FFT overlap must be between 0.0 and 1.0");
-        }
-        if self.spectro_bins > self.fft_size / 2 {
-            anyhow::bail!("Spectrogram bins must be <= FFT size / 2");
-        }
         if self.audio_codec != "opus" && self.audio_codec != "pcm" {
             anyhow::bail!("Audio codec must be 'opus' or 'pcm'");
         }
 
-        if self.audio_path == self.spectro_path
-            || self.audio_path == self.config_path
-            || self.spectro_path == self.config_path
-        {
+        if self.audio_path == self.config_path {
             anyhow::bail!("WebSocket endpoint paths must be different");
         }
 
