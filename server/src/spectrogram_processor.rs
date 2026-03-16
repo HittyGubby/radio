@@ -105,15 +105,7 @@ impl SpectrogramProcessor {
 
         for i in 0..self.max_bins {
             let magnitude = buffer[i].norm();
-            let db = if magnitude > 0.0 {
-                20.0 * magnitude.log10()
-            } else {
-                self.min_db
-            };
-
-            // Scale to 0-255 range
-            let scaled = ((db - self.min_db) / (self.max_db - self.min_db) * 255.0).clamp(0.0, 255.0);
-            result.push(scaled as u8);
+            result.push(magnitude as u8);
         }
 
         result

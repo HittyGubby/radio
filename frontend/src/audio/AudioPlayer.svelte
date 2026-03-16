@@ -15,11 +15,9 @@
   }
 
   let audioConfig: AudioConfig | null = null;
-  let OUTPUT_SAMPLE_RATE = 0; // Sample rate for encoded audio (from server)
-  let ACTUAL_SAMPLE_RATE = 0; // Actual AudioContext sample rate (may differ)
+  let OUTPUT_SAMPLE_RATE = 0;
 
   let audioContext: AudioContext | null = null;
-  let analyserNode: AnalyserNode | null = null;
   let ws: WebSocket | null = null;
   let reconnectTimer: number | null = null;
   let packetTimestamps: number[] = [];
@@ -27,17 +25,17 @@
   let workletNode: any = null;
   let feedIntervalId: number | null = null;
 
-  let JITTER_BUFFER_SAMPLES = 0; // Will be calculated after config is fetched
-  let MIN_BUFFER_SAMPLES = 0; // Will be calculated after config is fetched
-  let jitterBuffer: Float32Array = new Float32Array(JITTER_BUFFER_SAMPLES);
+  let JITTER_BUFFER_SAMPLES = 0;
+  let MIN_BUFFER_SAMPLES = 0;
+  let jitterBuffer: Float32Array = new Float32Array(0);
   let jitterBufferWritePos = 0;
   let jitterBufferReadPos = 0;
   let jitterBufferFilled = false;
   let playbackStarted = false;
   let samplesFedToWorklet = 0;
-  let lastReportedTotalProcessed = 0;
-  let opusDecodeErrors = 0;
   let opusDecoderReady = false;
+
+  let currentAudioTimestamp = 0;
 
   async function fetchAudioConfig() {
     try {
@@ -48,10 +46,10 @@
       const config = (await response.json()) as AudioConfig;
       audioConfig = config;
       OUTPUT_SAMPLE_RATE = config.output_sample_rate;
-      JITTER_BUFFER_SAMPLES = (OUTPUT_SAMPLE_RATE * config.jitter_buffer_ms) / 1000;
-      MIN_BUFFER_SAMPLES = (OUTPUT_SAMPLE_RATE * (config.jitter_buffer_ms / 2)) / 1000;
+      JITTER_BUFFER_SAMPLES = Math.floor((OUTPUT_SAMPLE_RATE * config.jitter_buffer_ms) / 1000);
+      MIN_BUFFER_SAMPLES = Math.floor(JITTER_BUFFER_SAMPLES / 2);
       jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
-      console.log("Audio config loaded - Output sample rate:", OUTPUT_SAMPLE_RATE, "Input sample rate:", config.input_sample_rate);
+      console.log("Audio config loaded:", OUTPUT_SAMPLE_RATE);
     } catch (e) {
       console.error("Failed to fetch audio config:", e);
     }
@@ -65,21 +63,11 @@
   });
 
   onDestroy(() => {
-    if (ws) {
-      ws.close();
-    }
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-    }
-    if (feedIntervalId) {
-      clearInterval(feedIntervalId);
-    }
-    if (audioContext) {
-      audioContext.close();
-    }
-    if (opusDecoder) {
-      opusDecoder.free();
-    }
+    if (ws) ws.close();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (feedIntervalId) clearInterval(feedIntervalId);
+    if (audioContext) audioContext.close();
+    if (opusDecoder) opusDecoder.free();
   });
 
   async function initOpusDecoder() {
@@ -98,73 +86,33 @@
   }
 
   async function initAudioContext() {
-    // Ensure we have a valid sample rate from config
     if (OUTPUT_SAMPLE_RATE === 0) {
-      console.error("Output sample rate not set, cannot initialize AudioContext");
+      console.error("Output sample rate not set");
       return;
     }
 
-    // Mobile compatibility: Try to use the system's preferred sample rate
-    // Some mobile devices don't support custom sample rates
     const contextOptions: AudioContextOptions = {};
-
-    // On mobile, it's better to let the browser choose the sample rate
-    // iOS and Android have different preferred rates (44.1kHz or 48kHz)
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-
-    if (!isMobile) {
-      // Only force sample rate on desktop
-      contextOptions.sampleRate = OUTPUT_SAMPLE_RATE;
-    }
+    contextOptions.sampleRate = OUTPUT_SAMPLE_RATE;
 
     audioContext = new (window.AudioContext || (window as any).webkitAudioContext)(contextOptions);
 
-    // Store the actual AudioContext sample rate (may differ from OUTPUT_SAMPLE_RATE)
-    ACTUAL_SAMPLE_RATE = audioContext.sampleRate;
-    console.log("Audio context created - Output sample rate:", OUTPUT_SAMPLE_RATE, "Actual context sample rate:", ACTUAL_SAMPLE_RATE);
-
-    // Mobile compatibility: Adjust jitter buffer for higher latency on mobile
-    // Android can have 300ms+ latency, iOS typically better but still significant
-    const latencyMultiplier = isMobile ? 2.0 : 1.0;
     const jitterBufferMs = audioConfig?.jitter_buffer_ms || 200;
-    JITTER_BUFFER_SAMPLES = Math.floor((OUTPUT_SAMPLE_RATE * jitterBufferMs * latencyMultiplier) / 1000);
+    JITTER_BUFFER_SAMPLES = Math.floor((OUTPUT_SAMPLE_RATE * jitterBufferMs) / 1000);
     MIN_BUFFER_SAMPLES = Math.floor(JITTER_BUFFER_SAMPLES / 2);
     jitterBuffer = new Float32Array(JITTER_BUFFER_SAMPLES);
 
-    // Mobile compatibility: Use larger FFT size for better performance on slower devices
-    const mobileFFTSize = isMobile ? 4096 : 1024;
+    resumeAudio();
 
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = mobileFFTSize;
-    analyserNode.smoothingTimeConstant = 0.0;
-    analyserNode.minDecibels = -100;
-    analyserNode.maxDecibels = 0;
-
-    if (audioContext.state === "suspended") {
-      await audioContext.resume();
-    }
-
-    // Mobile compatibility: Prefer ScriptProcessor on mobile for better stability
-    // AudioWorklet can have issues with low latency (128 samples) causing distortion
-    if (isMobile || !audioContext.audioWorklet) {
+    if (!audioContext.audioWorklet) {
       initScriptProcessor();
     } else {
       try {
         await audioContext.audioWorklet.addModule(new URL("../workers/audio-processor.js", import.meta.url));
-
         workletNode = new AudioWorkletNode(audioContext, "audio-processor", {
           outputChannelCount: [1],
         });
 
-        workletNode.connect(analyserNode);
-        analyserNode.connect(audioContext.destination);
-
-        workletNode.port.onmessage = (event: MessageEvent) => {
-          if (event.data.type === "stats") {
-            lastReportedTotalProcessed = event.data.totalProcessed;
-          }
-        };
-
+        workletNode.connect(audioContext.destination);
         dispatch("audioContextReady", audioContext);
         startContinuousFeeding();
       } catch (e) {
@@ -176,7 +124,6 @@
 
   function initScriptProcessor() {
     let audioBuffer = new Float32Array(0);
-
     const bufferSize = 4096;
     const scriptProcessor = audioContext!.createScriptProcessor(bufferSize, 0, 1);
 
@@ -184,26 +131,15 @@
       const output = event.outputBuffer.getChannelData(0);
 
       for (let i = 0; i < output.length; i++) {
-        if (i < audioBuffer.length) {
-          output[i] = audioBuffer[i];
-        } else {
-          output[i] = 0;
-        }
+        output[i] = i < audioBuffer.length ? audioBuffer[i] : 0;
       }
 
-      if (output.length < audioBuffer.length) {
-        audioBuffer = audioBuffer.slice(output.length);
-      } else {
-        audioBuffer = new Float32Array(0);
-      }
+      audioBuffer = output.length < audioBuffer.length ? audioBuffer.slice(output.length) : new Float32Array(0);
     };
 
-    scriptProcessor.connect(analyserNode!);
-    analyserNode!.connect(audioContext!.destination);
+    scriptProcessor.connect(audioContext!.destination);
     workletNode = scriptProcessor;
-
     (workletNode as any).audioBuffer = audioBuffer;
-
     dispatch("audioContextReady", audioContext);
     startContinuousFeeding();
   }
@@ -216,34 +152,39 @@
 
   function feedSamplesToWorklet() {
     if (!workletNode || !playbackStarted) return;
+    const samplesToFeed = getAvailableSamples();
+    if (samplesToFeed === 0) return;
+    const chunk = new Float32Array(samplesToFeed);
 
-    const available = getAvailableSamples();
-
-    if (available === 0) {
-      return;
+    for (let i = 0; i < samplesToFeed; i++) {
+      chunk[i] = jitterBuffer[jitterBufferReadPos];
+      jitterBufferReadPos = (jitterBufferReadPos + 1) % JITTER_BUFFER_SAMPLES;
     }
 
-    const samplesToFeed = Math.min(960, available);
+    samplesFedToWorklet += samplesToFeed;
 
-    if (samplesToFeed > 0) {
-      const chunk = new Float32Array(samplesToFeed);
+    if (workletNode.port) {
+      workletNode.port.postMessage({
+        type: "addBuffer",
+        samples: chunk,
+      });
+    } else if (workletNode.audioBuffer) {
+      const maxBufferSize = OUTPUT_SAMPLE_RATE * 2; // Max 2 seconds of buffered audio
+      const currentLength = workletNode.audioBuffer.length;
+      const newLength = currentLength + chunk.length;
 
-      for (let i = 0; i < samplesToFeed; i++) {
-        chunk[i] = jitterBuffer[jitterBufferReadPos];
-        jitterBufferReadPos = (jitterBufferReadPos + 1) % JITTER_BUFFER_SAMPLES;
-      }
-
-      samplesFedToWorklet += samplesToFeed;
-
-      if (workletNode.port) {
-        workletNode.port.postMessage({
-          type: "addBuffer",
-          samples: chunk,
-        });
-      } else if (workletNode.audioBuffer) {
-        const newBuffer = new Float32Array(workletNode.audioBuffer.length + chunk.length);
+      if (newLength > maxBufferSize) {
+        // Buffer is too large, drop oldest samples
+        const keepLength = Math.floor(maxBufferSize * 0.75);
+        const droppedSamples = currentLength - keepLength;
+        const newBuffer = new Float32Array(keepLength + chunk.length);
+        newBuffer.set(workletNode.audioBuffer.subarray(droppedSamples));
+        newBuffer.set(chunk, keepLength);
+        workletNode.audioBuffer = newBuffer;
+      } else {
+        const newBuffer = new Float32Array(newLength);
         newBuffer.set(workletNode.audioBuffer);
-        newBuffer.set(chunk, workletNode.audioBuffer.length);
+        newBuffer.set(chunk, currentLength);
         workletNode.audioBuffer = newBuffer;
       }
     }
@@ -252,9 +193,9 @@
   function getAvailableSamples(): number {
     if (jitterBufferFilled) {
       return (JITTER_BUFFER_SAMPLES + jitterBufferWritePos - jitterBufferReadPos) % JITTER_BUFFER_SAMPLES;
-    } else {
-      return jitterBufferWritePos - jitterBufferReadPos;
     }
+    const available = jitterBufferWritePos - jitterBufferReadPos;
+    return Math.max(0, available);
   }
 
   function connectWebSocket() {
@@ -268,11 +209,7 @@
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-
-      // Resume audio context when WebSocket reconnects
-      if (audioContext && audioContext.state === "suspended") {
-        audioContext.resume();
-      }
+      resumeAudio();
     };
 
     ws.onmessage = async (event) => {
@@ -280,10 +217,10 @@
       const timestamp = Number(data.getBigUint64(0, true));
       const payload = new Uint8Array(event.data, 8);
 
+      currentAudioTimestamp = timestamp;
       await queueAudioPacket(payload, timestamp);
       packetTimestamps.push(Date.now());
 
-      // Keep only timestamps from the last 5 seconds (sliding window)
       const now = Date.now();
       packetTimestamps = packetTimestamps.filter((ts) => now - ts < 1000);
     };
@@ -314,14 +251,10 @@
         if (payload.length === 0) {
           throw new Error("Empty payload");
         }
-
         const result = opusDecoder.decodeFrame(payload);
         samples = result.channelData[0];
-        opusDecodeErrors = 0;
       } catch (e) {
-        opusDecodeErrors++;
-        console.error(`Opus decode error (${opusDecodeErrors}), payload size: ${payload.length}:`, e);
-
+        console.error("Opus decode error:", e);
         opusDecoder = null;
         opusDecoderReady = false;
       }
@@ -362,7 +295,6 @@
     jitterBufferFilled = false;
     playbackStarted = false;
     samplesFedToWorklet = 0;
-    lastReportedTotalProcessed = 0;
     packetTimestamps = [];
 
     if (workletNode && workletNode.port) {
@@ -371,9 +303,7 @@
 
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (audioContext && audioContext.state === "suspended") {
-        audioContext.resume();
-      }
+      resumeAudio();
       connectWebSocket();
     }, 1000);
   }
@@ -387,8 +317,8 @@
     return (packetTimestamps.length / timeWindowSeconds).toFixed(2) as unknown as number;
   }
 
-  export function getAnalyserNode(): AnalyserNode | null {
-    return analyserNode;
+  export function getCurrentAudioTimestamp(): number {
+    return currentAudioTimestamp;
   }
 
   export async function resumeAudio() {
@@ -400,8 +330,7 @@
   export function getAudioStats() {
     return {
       sampleRate: OUTPUT_SAMPLE_RATE,
-      actualSampleRate: ACTUAL_SAMPLE_RATE,
-      bitrate: audioConfig?.audio_bitrate || 0,
+      bitrate: audioConfig?.audio_bitrate,
       jitterBufferSamples: getAvailableSamples(),
       jitterBufferCapacity: JITTER_BUFFER_SAMPLES,
       wsConnected: ws !== null && ws.readyState === WebSocket.OPEN,

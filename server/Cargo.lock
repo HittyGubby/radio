@@ -1305,6 +1305,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-tungstenite",
+ "libspa",
  "log",
  "opus",
  "pipewire",

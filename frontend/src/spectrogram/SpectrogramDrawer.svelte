@@ -1,302 +1,315 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
 
-  // ===== TUNABLE PARAMETERS =====
-  // Maximum frequency to display in Hz (will be updated from config)
-  let MAX_FREQUENCY = 0;
-  // Whether to show frequency grid lines
-  const SHOW_GRID = false;
-  // Grid line frequencies in Hz
-  const GRID_FREQUENCIES: number[] = [100, 500, 1000, 2000, 5000, 10000, 15000];
-  // Maximum buffer size (in frames) to prevent memory issues
-  const MAX_BUFFER_FRAMES = 100;
-  // Smoothing factor for temporal interpolation (0-1, higher = more smoothing)
-  const SMOOTHING_FACTOR = 0.5;
-  // Column width in pixels (stretch factor) - higher = faster flow
-  const COLUMN_WIDTH = 2;
-  // =================================
+  const COLUMN_WIDTH = 3;
 
   let canvas: HTMLCanvasElement;
-  let ctx: CanvasRenderingContext2D;
-  let animationId: number | null = null;
+
+  let width = 0;
+  let height = 0;
+
   let ws: WebSocket | null = null;
   let reconnectTimer: number | null = null;
 
-  // FIFO buffer to store frames in order
-  let frameQueue: Uint8Array[] = [];
-  let previousFrame: Uint8Array | null = null;
+  let device: GPUDevice;
+  let context: GPUCanvasContext;
+  let pipeline: GPURenderPipeline;
+  let texture: GPUTexture;
+  let sampler: GPUSampler;
+  let bindGroup: GPUBindGroup;
 
-  // Offscreen canvas for double buffering
-  let offscreenCanvas: HTMLCanvasElement;
-  let offscreenCtx: CanvasRenderingContext2D;
+  let pixelBuffer: Uint8Array;
 
-  // Smooth rendering system
-  let lastDrawTime = 0;
-  const TARGET_FPS = 60;
-  const FRAME_TIME_MS = 1000 / TARGET_FPS;
+  let frames: Uint8Array[] = [];
+  let smoothedFrame: Uint8Array | null = null;
 
   const SPECTRO_URL = "/spectro";
-  const CONFIG_URL = "/config";
 
-  onMount(() => {
+  let animationId: number;
+
+  onMount(async () => {
     canvas = document.getElementById("spectro-canvas") as HTMLCanvasElement;
-    ctx = canvas.getContext("2d")!;
 
-    resizeCanvas();
-    fetchSpectroConfig();
-    connectWebSocket();
-    startRendering();
+    const adapter = await navigator.gpu.requestAdapter();
+    device = await adapter!.requestDevice();
 
-    window.addEventListener("resize", resizeCanvas);
+    context = canvas.getContext("webgpu") as GPUCanvasContext;
+
+    const format = navigator.gpu.getPreferredCanvasFormat();
+
+    context.configure({
+      device,
+      format,
+      alphaMode: "premultiplied",
+    });
+
+    initPipeline(format);
+    resize();
+    connect();
+    render();
+
+    window.addEventListener("resize", resize);
   });
 
   onDestroy(() => {
-    if (animationId) {
-      cancelAnimationFrame(animationId);
-    }
-    window.removeEventListener("resize", resizeCanvas);
-    if (ws) {
-      ws.close();
-    }
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-    }
+    cancelAnimationFrame(animationId);
+    ws?.close();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
   });
 
-  function resizeCanvas() {
+  function resize() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Create offscreen canvas for double buffering
-    offscreenCanvas = document.createElement("canvas");
-    offscreenCanvas.width = canvas.width;
-    offscreenCanvas.height = canvas.height;
-    offscreenCtx = offscreenCanvas.getContext("2d")!;
-    offscreenCtx.fillStyle = "#000";
-    offscreenCtx.fillRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+    width = canvas.width;
+    height = canvas.height;
+
+    pixelBuffer = new Uint8Array(width * height * 4);
+
+    texture?.destroy();
+
+    texture = device.createTexture({
+      size: [width, height],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+
+    bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: texture.createView() },
+      ],
+    });
   }
 
-  async function fetchSpectroConfig() {
-    try {
-      const response = await fetch(CONFIG_URL);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const config = await response.json();
-      if (config.spectro_max_freq) {
-        MAX_FREQUENCY = config.spectro_max_freq;
-        console.log("Spectrogram max frequency updated to:", MAX_FREQUENCY);
-      }
-    } catch (e) {
-      console.error("Failed to fetch spectrogram config:", e);
-    }
+  function initPipeline(format: GPUTextureFormat) {
+    const shader = device.createShaderModule({
+      code: `
+
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f
+}
+
+@vertex
+fn vs(@builtin(vertex_index) i:u32)->VOut{
+
+var pos=array<vec2f,6>(
+vec2f(-1,-1),
+vec2f(1,-1),
+vec2f(-1,1),
+vec2f(-1,1),
+vec2f(1,-1),
+vec2f(1,1)
+);
+
+var o:VOut;
+o.pos=vec4f(pos[i],0,1);
+o.uv=(pos[i]+1)*0.5;
+o.uv.y=1-o.uv.y;
+
+return o;
+}
+
+@group(0)@binding(0)var s:sampler;
+@group(0)@binding(1)var t:texture_2d<f32>;
+
+@fragment
+fn fs(@location(0)uv:vec2f)->@location(0)vec4f{
+return textureSample(t,s,uv);
+}
+`,
+    });
+
+    pipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: shader, entryPoint: "vs" },
+      fragment: { module: shader, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    });
+
+    sampler = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+    });
   }
 
-  function connectWebSocket() {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    ws = new WebSocket(`${protocol}//${host}${SPECTRO_URL}`);
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+
+    ws = new WebSocket(`${proto}://${location.host}${SPECTRO_URL}`);
     ws.binaryType = "arraybuffer";
 
-    ws.onopen = () => {
-      console.log("Spectrogram WebSocket connected");
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-    };
+    ws.onmessage = (e) => {
+      const dv = new DataView(e.data);
 
-    ws.onmessage = (event) => {
-      const data = new DataView(event.data);
-      const timestamp = Number(data.getBigUint64(0, true));
-      const frameCount = data.getUint32(8, true);
+      let offset = 0;
+      const count = dv.getUint32(offset, true);
+      offset += 4;
 
-      let offset = 12;
+      for (let i = 0; i < count; i++) {
+        const ts = Number(dv.getBigUint64(offset, true));
+        offset += 8;
 
-      for (let i = 0; i < frameCount; i++) {
-        const frameLen = data.getUint32(offset, true);
+        const len = dv.getUint32(offset, true);
         offset += 4;
-        const frameData = new Uint8Array(event.data, offset, frameLen);
 
-        // Add frame to queue (FIFO)
-        frameQueue.push(frameData);
+        frames.push(new Uint8Array(e.data, offset, len));
 
-        offset += frameLen;
+        offset += len;
       }
 
-      // Prune old frames to prevent memory issues
-      while (frameQueue.length > MAX_BUFFER_FRAMES) {
-        frameQueue.shift();
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error("Spectrogram WebSocket error:", error);
-      scheduleReconnect();
+      if (frames.length > 200) frames.splice(0, frames.length - 200);
     };
 
     ws.onclose = () => {
-      scheduleReconnect();
+      reconnectTimer = setTimeout(connect, 3000);
     };
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connectWebSocket();
-    }, 3000);
-  }
+  function render() {
+    draw();
 
-  function startRendering() {
-    lastDrawTime = performance.now();
-    requestAnimationFrame(render);
-  }
-
-  function drawSmoothFrame() {
-    if (frameQueue.length === 0) return;
-
-    // Draw one frame from the queue
-    const frame = frameQueue.shift()!;
-
-    const maxBins = frame.length || 0;
-
-    // Shift offscreen canvas to the left by one column width
-    offscreenCtx.drawImage(offscreenCanvas, COLUMN_WIDTH, 0, offscreenCanvas.width - COLUMN_WIDTH, offscreenCanvas.height, 0, 0, offscreenCanvas.width - COLUMN_WIDTH, offscreenCanvas.height);
-
-    // Draw the new frame at the right edge
-    const x = offscreenCanvas.width - COLUMN_WIDTH;
-    drawColumnToOffscreen(frame, previousFrame, x, COLUMN_WIDTH, maxBins);
-    previousFrame = frame;
-  }
-
-  function render(timestamp: number) {
-    // Calculate elapsed time since last draw
-    const elapsed = timestamp - lastDrawTime;
-
-    // Draw frames at constant rate
-    if (elapsed >= FRAME_TIME_MS) {
-      lastDrawTime = timestamp - (elapsed % FRAME_TIME_MS);
-
-      // Draw one frame from queue (or multiple if needed to catch up)
-      drawSmoothFrame();
-    }
-
-    // Render offscreen canvas to main canvas (smooth 60fps)
-    ctx.drawImage(offscreenCanvas, 0, 0);
-
-    // Draw grid on top
-    if (SHOW_GRID) {
-      drawGrid();
-    }
+    renderGPU();
 
     animationId = requestAnimationFrame(render);
   }
 
-  function addFramesToOffscreen() {
-    if (frameQueue.length === 0) return;
+  function draw() {
+    if (frames.length === 0) return;
 
-    const maxBins = frameQueue[0]?.length || 0;
-    const totalWidth = frameQueue.length * COLUMN_WIDTH;
+    const frame = frames.shift()!;
 
-    if (totalWidth > 0) {
-      // Shift offscreen canvas to the left
-      offscreenCtx.drawImage(offscreenCanvas, totalWidth, 0, offscreenCanvas.width - totalWidth, offscreenCanvas.height, 0, 0, offscreenCanvas.width - totalWidth, offscreenCanvas.height);
+    scroll();
 
-      // Draw all frames at the right edge of offscreen canvas
-      for (let i = 0; i < frameQueue.length; i++) {
-        const currentFrame = frameQueue[i];
-        const x = offscreenCanvas.width - totalWidth + i * COLUMN_WIDTH;
-        drawColumnToOffscreen(currentFrame, previousFrame, x, COLUMN_WIDTH, maxBins);
-        previousFrame = currentFrame;
+    drawColumn(frame);
+  }
+
+  function scroll() {
+    const shift = COLUMN_WIDTH;
+
+    for (let y = 0; y < height; y++) {
+      const row = y * width * 4;
+
+      for (let x = 0; x < width - shift; x++) {
+        const src = row + (x + shift) * 4;
+        const dst = row + x * 4;
+
+        pixelBuffer[dst] = pixelBuffer[src];
+        pixelBuffer[dst + 1] = pixelBuffer[src + 1];
+        pixelBuffer[dst + 2] = pixelBuffer[src + 2];
+        pixelBuffer[dst + 3] = 255;
       }
-
-      // Clear the queue after drawing all frames
-      frameQueue = [];
     }
   }
 
-  function drawColumnToOffscreen(frequencyData: Uint8Array, prevFrame: Uint8Array | null, x: number, width: number, maxBins: number) {
-    // Create ImageData for the column with specified width
-    const imageData = offscreenCtx.createImageData(width, offscreenCanvas.height);
-    const data = imageData.data;
-
-    for (let y = 0; y < offscreenCanvas.height; y++) {
-      // Use logarithmic scaling for better frequency distribution
-      const normalizedY = y / offscreenCanvas.height;
-      const exactBinIndex = Math.pow(normalizedY, 1.5) * maxBins;
-
-      // Get the two nearest bins for interpolation
-      const binIndexLow = Math.floor(exactBinIndex);
-      const binIndexHigh = Math.min(binIndexLow + 1, maxBins - 1);
-      const interpolationFactor = exactBinIndex - binIndexLow;
-
-      // Get intensities from current frame
-      let intensityLow = binIndexLow < frequencyData.length ? frequencyData[binIndexLow] : 0;
-      let intensityHigh = binIndexHigh < frequencyData.length ? frequencyData[binIndexHigh] : 0;
-
-      // Interpolate between adjacent bins in frequency domain
-      let intensity = Math.floor(intensityLow * (1 - interpolationFactor) + intensityHigh * interpolationFactor);
-
-      // Apply temporal smoothing with previous frame
-      if (prevFrame) {
-        let prevIntensityLow = binIndexLow < prevFrame.length ? prevFrame[binIndexLow] : 0;
-        let prevIntensityHigh = binIndexHigh < prevFrame.length ? prevFrame[binIndexHigh] : 0;
-
-        // Interpolate between adjacent bins in previous frame
-        let prevIntensity = Math.floor(prevIntensityLow * (1 - interpolationFactor) + prevIntensityHigh * interpolationFactor);
-
-        // Temporal smoothing
-        intensity = Math.floor(intensity * (1 - SMOOTHING_FACTOR) + prevIntensity * SMOOTHING_FACTOR);
-      }
-
-      const [r, g, b] = getPaletteColor(intensity);
-
-      // Fill all pixels in the column width
-      for (let px = 0; px < width; px++) {
-        const pixelIndex = (y * width + px) * 4;
-        data[pixelIndex] = r;
-        data[pixelIndex + 1] = g;
-        data[pixelIndex + 2] = b;
-        data[pixelIndex + 3] = 255;
+  function drawColumn(frame: Uint8Array) {
+    // Apply temporal smoothing
+    let processedFrame: Uint8Array;
+    if (smoothedFrame === null) {
+      processedFrame = new Uint8Array(frame);
+      smoothedFrame = new Uint8Array(frame);
+    } else {
+      // Ensure arrays are same length
+      if (smoothedFrame.length !== frame.length) {
+        smoothedFrame = new Uint8Array(frame);
+        processedFrame = new Uint8Array(frame);
+      } else {
+        // Exponential smoothing: smoothed = alpha * current + (1 - alpha) * previous
+        // Alpha of 0.7 means 70% current, 30% previous (adjust based on preference)
+        const alpha = 0.5;
+        processedFrame = new Uint8Array(frame.length);
+        for (let i = 0; i < frame.length; i++) {
+          processedFrame[i] = Math.round(alpha * frame[i] + (1 - alpha) * smoothedFrame[i]);
+        }
       }
     }
 
-    offscreenCtx.putImageData(imageData, x, 0);
-  }
+    // Update smoothed frame for next iteration
+    smoothedFrame.set(processedFrame);
 
-  function getPaletteColor(intensity: number): [number, number, number] {
-    const i = intensity / 255;
-    const a = 2;
-    const x = -Math.log(1 - i) / Math.log(a);
-    return [Math.round(x * 20), Math.round(x * 20), Math.round(x * 40)];
-  }
+    const x = width - COLUMN_WIDTH;
 
-  function drawGrid() {
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
-    ctx.lineWidth = 1;
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
+    const bins = processedFrame.length;
 
-    for (const freq of GRID_FREQUENCIES) {
-      if (freq >= MAX_FREQUENCY) continue;
+    // First, compute all pixel values for this column
+    const columnPixels: [number, number, number][] = [];
+    for (let y = 0; y < height; y++) {
+      const ny = y / height;
 
-      // Calculate y position based on logarithmic scale
-      const normalizedFreq = freq / MAX_FREQUENCY;
-      const y = Math.pow(normalizedFreq, 1.5) * canvas.height;
+      const exact = Math.pow(ny, 1.5) * bins;
 
-      // Draw line
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(canvas.width, y);
-      ctx.stroke();
+      const lo = Math.floor(exact);
+      const hi = Math.min(lo + 1, bins - 1);
 
-      // Draw label
-      const label = freq >= 1000 ? `${freq / 1000}k` : `${freq}`;
-      ctx.fillText(label, 5, y - 3);
+      const f = exact - lo;
+
+      const v = (processedFrame[lo] ?? 0) * (1 - f) + (processedFrame[hi] ?? 0) * f;
+
+      columnPixels.push(palette(v));
     }
+
+    // Draw the column with cross-column blending
+    for (let y = 0; y < height; y++) {
+      const [r, g, b] = columnPixels[y];
+
+      for (let px = 0; px < COLUMN_WIDTH; px++) {
+        const idx = (y * width + x + px) * 4;
+
+        // Apply cross-column blending at the left edge of the column
+        // (except for the very first pixel of the column which should be sharp)
+        if (px === 0 && x > 0) {
+          // Get the previous column's pixel
+          const prevIdx = (y * width + x - 1) * 4;
+          const prevR = pixelBuffer[prevIdx];
+          const prevG = pixelBuffer[prevIdx + 1];
+          const prevB = pixelBuffer[prevIdx + 2];
+
+          // Blend with 50% of previous column for smooth transition
+          const blendFactor = 0.5;
+          pixelBuffer[idx] = Math.round(r * (1 - blendFactor) + prevR * blendFactor);
+          pixelBuffer[idx + 1] = Math.round(g * (1 - blendFactor) + prevG * blendFactor);
+          pixelBuffer[idx + 2] = Math.round(b * (1 - blendFactor) + prevB * blendFactor);
+          pixelBuffer[idx + 3] = 255;
+        } else {
+          pixelBuffer[idx] = r;
+          pixelBuffer[idx + 1] = g;
+          pixelBuffer[idx + 2] = b;
+          pixelBuffer[idx + 3] = 255;
+        }
+      }
+    }
+  }
+
+  function renderGPU() {
+    device.queue.writeTexture({ texture }, pixelBuffer, { bytesPerRow: width * 4 }, { width, height });
+
+    const enc = device.createCommandEncoder();
+
+    const view = context.getCurrentTexture().createView();
+
+    const pass = enc.beginRenderPass({
+      colorAttachments: [
+        {
+          view,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
+    });
+
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(6);
+    pass.end();
+
+    device.queue.submit([enc.finish()]);
+  }
+
+  function palette(i: number): [number, number, number] {
+    return [Math.min(i * 8, 255), Math.min(i * 6, 255), Math.min(i * 12, 255)];
   }
 </script>
 

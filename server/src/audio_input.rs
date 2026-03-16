@@ -72,6 +72,7 @@ pub async fn start_audio_capture(
                 *pw::keys::MEDIA_ROLE => "Music",
                 *pw::keys::NODE_NAME => "radio-capture",
                 *pw::keys::NODE_AUTOCONNECT => "true",
+                *pw::keys::AUDIO_CHANNELS => "2",
             };
 
             let stream = pw::stream::Stream::new(&core, "radio-capture", stream_props)
@@ -97,6 +98,11 @@ pub async fn start_audio_capture(
                                 );
 
                                 let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
+                                let mut pos = [0u32; 64];
+                                pos[0] = spa::sys::SPA_AUDIO_CHANNEL_FL as u32;
+                                pos[1] = spa::sys::SPA_AUDIO_CHANNEL_FR as u32;
+                                audio_info.set_channels(2);
+                                audio_info.set_position(pos);
                                 if audio_info.parse(p).is_ok() {
                                     info!(
                                         "Audio format: rate={}, channels={}, format={:?}",
@@ -127,8 +133,18 @@ pub async fn start_audio_capture(
                                         )
                                     };
 
-                                    let samples_vec: Vec<f32> = sample_slice.to_vec();
-                                    let _ = audio_tx_clone.send(samples_vec);
+                                    // Convert stereo to mono by averaging channels
+                                    // Samples are interleaved as [L, R, L, R, ...]
+                                    let mono_samples: Vec<f32> = if config.channels == 2 {
+                                        sample_slice
+                                            .chunks(2)
+                                            .map(|pair| (pair[0] + pair[1]) / 2.0)
+                                            .collect()
+                                    } else {
+                                        sample_slice.to_vec()
+                                    };
+
+                                    let _ = audio_tx_clone.send(mono_samples);
                                     samples_written_clone.fetch_add(
                                         samples as u64,
                                         std::sync::atomic::Ordering::Relaxed,
@@ -144,6 +160,18 @@ pub async fn start_audio_capture(
             audio_info.set_format(pw::spa::param::audio::AudioFormat::F32LE);
             audio_info.set_rate(config.get_input_sample_rate());
             audio_info.set_channels(config.channels as u32);
+
+            // Set channel positions based on configuration
+            let mut pos = [0u32; 64];
+            if config.channels == 2 {
+                // Stereo
+                pos[0] = spa::sys::SPA_AUDIO_CHANNEL_FL as u32;
+                pos[1] = spa::sys::SPA_AUDIO_CHANNEL_FR as u32;
+            } else {
+                // Mono
+                pos[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO as u32;
+            }
+            audio_info.set_position(pos);
 
             let obj = pw::spa::pod::Object {
                 type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),

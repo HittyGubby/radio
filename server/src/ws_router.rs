@@ -177,17 +177,16 @@ async fn handle_spectro_client(
     client_count: Arc<AtomicUsize>,
     spectro_history: Option<Arc<Mutex<SpectroHistory>>>,
 ) {
-    // Send historical frames on initial connection
-    if let Some(history) = spectro_history {
-        let history_packets = history.lock().await.get_all().to_vec();
-        for packet in &history_packets {
-            let data = packet.to_bytes();
-            if let Err(_e) = ws.send(Message::Binary(data)).await {
-                return;
-            }
-        }
-        info!("Sent {} historical spectrogram packets to new client", history_packets.len());
-    }
+    // // Send historical frames on initial connection
+    // if let Some(history) = spectro_history {
+    //     let history_packets = history.lock().await.get_all().to_vec();
+    //     for packet in &history_packets {
+    //         let data = packet.to_bytes();
+    //         if let Err(_e) = ws.send(Message::Binary(data)).await {
+    //             return;
+    //         }
+    //     }
+    // }
 
     loop {
         tokio::select! {
