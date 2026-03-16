@@ -190,8 +190,11 @@ async fn main() -> anyhow::Result<()> {
         let output_frame_interval = Duration::from_millis((spectro_config.spectro_frame_ms * frames_per_packet) as u64);
         let mut last_input_frame_time = Instant::now();
         let mut last_output_frame_time = Instant::now();
-        let start_time = Instant::now();
-        let mut accumulated_frames: Vec<Vec<u8>> = Vec::new();
+        let mut accumulated_frames: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        // Track audio sample index for timestamp synchronization
+        // Use the SAME timebase as audio encoder (output sample count)
+        let mut audio_sample_index = 0u64;
 
         loop {
             tokio::select! {
@@ -214,7 +217,10 @@ async fn main() -> anyhow::Result<()> {
 
                                 // Process FFT
                                 let frequency_data = processor.process(&frame_samples);
-                                accumulated_frames.push(frequency_data);
+
+                                // Each frame gets its own timestamp
+                                let frame_timestamp = audio_sample_index;
+                                accumulated_frames.push((frame_timestamp, frequency_data));
 
                                 last_input_frame_time = now;
                             }
@@ -231,9 +237,8 @@ async fn main() -> anyhow::Result<()> {
                         let elapsed_output = now.duration_since(last_output_frame_time);
 
                         if accumulated_frames.len() >= frames_per_packet || (elapsed_output >= output_frame_interval && !accumulated_frames.is_empty()) {
-                            // Create spectrogram packet with accumulated frames
+                            // Create spectrogram packet with accumulated frames (each with its own timestamp)
                             let packet = spectrogram_ws::SpectrogramPacket::new_with_frames(
-                                start_time.elapsed().as_millis() as u64,
                                 accumulated_frames.clone(),
                             );
 
@@ -245,6 +250,11 @@ async fn main() -> anyhow::Result<()> {
                             accumulated_frames.clear();
                             last_output_frame_time = now;
                         }
+
+                        // Update audio sample index
+                        // Calculate how many output samples this input chunk represents
+                        let output_samples_for_input = samples.len() as u64 * output_rate as u64 / input_rate as u64;
+                        audio_sample_index += output_samples_for_input;
                     }
                 }
             }

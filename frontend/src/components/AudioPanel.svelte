@@ -15,17 +15,6 @@
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   }
-
-  function formatBytes(bytes: number): string {
-    if (bytes < 1024) return bytes + " B/s";
-    else if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB/s";
-    else if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB/s";
-    else return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB/s";
-  }
-
-  function formatbitrate(bps: number): string {
-    return (bps / 1000).toFixed(2) + " Kbps";
-  }
 </script>
 
 <div class="audio-panel">
@@ -60,7 +49,7 @@
         </div>
         <div class="debug-row">
           <span class="label">Throughput:</span>
-          <span class="value">{((audioPacketPerSec * audioBitrate) / 48000).toFixed(2)} Kbps</span>
+          <span class="value">{((audioPacketPerSec * audioSampleRate) / 8000).toFixed(2)} Kbps</span>
         </div>
         <div class="debug-row">
           <span class="label">Buffer:</span>
@@ -68,7 +57,7 @@
         </div>
         <div class="debug-row">
           <span class="label">Sample Rate:</span>
-          <span class="value">{audioSampleRate}</span>
+          <span class="value">{audioSampleRate / 1000} kHz</span>
         </div>
         <div class="debug-row">
           <span class="label">Bitrate:</span>

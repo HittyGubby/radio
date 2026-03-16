@@ -15,9 +15,9 @@ channels = 1
 audio_codec = "opus"
 audio_bitrate = 24000
 audio_bitdepth = 16
-audio_frame_ms = 50
+audio_frame_ms = 60
 ring_buffer_seconds = 10
-jitter_buffer_ms = 500
+jitter_buffer_ms = 600
 
 # WebSocket server settings
 ws_bind = "[::]:23331"
@@ -36,7 +36,7 @@ spectro_window = "hann"
 spectro_smoothing = 0
 spectro_min_db = -100
 spectro_max_db = 0
-spectro_frame_ms = 50
+spectro_frame_ms = 60
 
 # Notes:
 # - All values can be overridden via command-line arguments
@@ -46,3 +46,4 @@ spectro_frame_ms = 50
 # - spectro_max_freq cannot exceed input_sample_rate / 2 (Nyquist frequency)
 # - input_sample_rate: Sample rate for audio capture and spectrogram
 # - output_sample_rate: Sample rate for encoded audio transmission (lower = less bandwidth)
+# - audio_frame_ms: Frame duration in milliseconds (opus: 2.5, 5, 10, 20, 40, 60; pcm: any)

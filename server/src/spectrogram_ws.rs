@@ -3,39 +3,33 @@ use serde::{Deserialize, Serialize};
 /// Spectrogram data packet sent over WebSocket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpectrogramPacket {
-    /// Timestamp in milliseconds
-    pub timestamp: u64,
-    /// Multiple frequency data frames (each frame is 0-255, representing dB levels)
-    pub frames: Vec<Vec<u8>>,
+    /// Multiple frames with individual timestamps
+    pub frames: Vec<(u64, Vec<u8>)>,
 }
 
 impl SpectrogramPacket {
     /// Create a new spectrogram packet with a single frame
     pub fn new(timestamp: u64, frequency_data: Vec<u8>) -> Self {
         Self {
-            timestamp,
-            frames: vec![frequency_data],
+            frames: vec![(timestamp, frequency_data)],
         }
     }
 
     /// Create a new spectrogram packet with multiple frames
-    pub fn new_with_frames(timestamp: u64, frames: Vec<Vec<u8>>) -> Self {
-        Self {
-            timestamp,
-            frames,
-        }
+    pub fn new_with_frames(frames: Vec<(u64, Vec<u8>)>) -> Self {
+        Self { frames }
     }
 
     /// Serialize the packet to binary format for WebSocket transmission
-    /// Format: [timestamp(8 bytes)][frame_count(4 bytes)][frame1_len(4 bytes)][frame1_data][frame2_len(4 bytes)][frame2_data]...
+    /// Format: [frame_count(4 bytes)][frame1_timestamp(8 bytes)][frame1_len(4 bytes)][frame1_data][frame2_timestamp(8 bytes)][frame2_len(4 bytes)][frame2_data]...
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(8 + 4);
-        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        let mut data = Vec::with_capacity(4 + self.frames.len() * 12);
         data.extend_from_slice(&(self.frames.len() as u32).to_le_bytes());
 
-        for frame in &self.frames {
-            data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-            data.extend_from_slice(frame);
+        for (timestamp, frame_data) in &self.frames {
+            data.extend_from_slice(&timestamp.to_le_bytes());
+            data.extend_from_slice(&(frame_data.len() as u32).to_le_bytes());
+            data.extend_from_slice(frame_data);
         }
 
         data
@@ -43,20 +37,25 @@ impl SpectrogramPacket {
 
     /// Deserialize a packet from binary format
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 {
+        if data.len() < 4 {
             return None;
         }
 
-        let timestamp = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
-        let frame_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let frame_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
         let mut frames = Vec::with_capacity(frame_count);
-        let mut offset = 12;
+        let mut offset = 4;
 
         for _ in 0..frame_count {
-            if offset + 4 > data.len() {
+            if offset + 12 > data.len() {
                 return None;
             }
+
+            let timestamp = u64::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            ]);
+            offset += 8;
 
             let frame_len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
@@ -65,14 +64,11 @@ impl SpectrogramPacket {
                 return None;
             }
 
-            frames.push(data[offset..offset + frame_len].to_vec());
+            frames.push((timestamp, data[offset..offset + frame_len].to_vec()));
             offset += frame_len;
         }
 
-        Some(Self {
-            timestamp,
-            frames,
-        })
+        Some(Self { frames })
     }
 
     /// Get the total number of frames in this packet
@@ -91,32 +87,34 @@ mod tests {
         let bytes = packet.to_bytes();
         let restored = SpectrogramPacket::from_bytes(&bytes).unwrap();
 
-        assert_eq!(restored.timestamp, packet.timestamp);
         assert_eq!(restored.frames.len(), 1);
-        assert_eq!(restored.frames[0], packet.frames[0]);
+        assert_eq!(restored.frames[0].0, 12345);
+        assert_eq!(restored.frames[0].1, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
     fn test_serialize_deserialize_multiple_frames() {
-        let packet = SpectrogramPacket::new_with_frames(12345, vec![
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-            vec![7, 8, 9],
+        let packet = SpectrogramPacket::new_with_frames(vec![
+            (1000, vec![1, 2, 3]),
+            (2000, vec![4, 5, 6]),
+            (3000, vec![7, 8, 9]),
         ]);
         let bytes = packet.to_bytes();
         let restored = SpectrogramPacket::from_bytes(&bytes).unwrap();
 
-        assert_eq!(restored.timestamp, packet.timestamp);
         assert_eq!(restored.frames.len(), 3);
-        assert_eq!(restored.frames[0], vec![1, 2, 3]);
-        assert_eq!(restored.frames[1], vec![4, 5, 6]);
-        assert_eq!(restored.frames[2], vec![7, 8, 9]);
+        assert_eq!(restored.frames[0].0, 1000);
+        assert_eq!(restored.frames[0].1, vec![1, 2, 3]);
+        assert_eq!(restored.frames[1].0, 2000);
+        assert_eq!(restored.frames[1].1, vec![4, 5, 6]);
+        assert_eq!(restored.frames[2].0, 3000);
+        assert_eq!(restored.frames[2].1, vec![7, 8, 9]);
     }
 
     #[test]
     fn test_empty_frames() {
-        let packet = SpectrogramPacket::new_with_frames(0, vec![]);
+        let packet = SpectrogramPacket::new_with_frames(vec![]);
         let bytes = packet.to_bytes();
-        assert_eq!(bytes.len(), 12); // timestamp + frame_count
+        assert_eq!(bytes.len(), 4); // frame_count only
     }
 }
