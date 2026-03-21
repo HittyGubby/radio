@@ -6,15 +6,12 @@
   export let playerProgress = 0;
 
   let container: HTMLElement;
-
   let lyrics: { time: number; text: string; translation: string | null }[] = [];
   let currentIndex = -1;
-
   let userScrolling = false;
   let scrollTimer: number | null = null;
   let lyricHash = "";
 
-  // rebuild lyrics only when metadata changes
   $: {
     const h = metadata.lyric + "|" + metadata.tlyric;
     if (h !== lyricHash) {

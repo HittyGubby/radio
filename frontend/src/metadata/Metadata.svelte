@@ -29,16 +29,13 @@
   export function mergeLyricsAndTranslation(lyricText: string, tlyricText: string): MergedLyricLine[] {
     const lyrics = parseLyrics(lyricText);
     const translations = parseLyrics(tlyricText);
-
     const merged: MergedLyricLine[] = [];
 
-    // Create a map of translations by time for quick lookup
     const translationMap = new Map<number, string>();
     for (const t of translations) {
       translationMap.set(t.time, t.text);
     }
 
-    // Merge lyrics with their translations
     for (const l of lyrics) {
       merged.push({
         time: l.time,
@@ -46,10 +43,7 @@
         translation: translationMap.get(l.time) || null,
       });
     }
-
-    // Sort by time
     merged.sort((a, b) => a.time - b.time);
-
     return merged;
   }
 
@@ -67,13 +61,10 @@
 </script>
 
 <script lang="ts">
-  const STATUS_URL = "/status";
-
   let eventSource: EventSource | null = null;
   let reconnectTimer: number | null = null;
-  let isRefreshing = false;
-  let metadataWorker: Worker | null = null;
-
+  let lastCall = 0;
+  export let playerProgress: number = 0;
   export let metadata: SongMetadata = {
     status: "",
     name: "",
@@ -86,37 +77,9 @@
     tlyric: "",
   };
 
-  export let playerProgress: number = 0;
-  export let onSongChange: () => void = () => {};
-
-  onMount(() => {
-    // Initialize metadata worker
-    metadataWorker = new Worker(new URL("../workers/metadata-worker.js", import.meta.url));
-    metadataWorker.onmessage = (e) => {
-      if (e.data.type === "success") {
-        const newMetadata: SongMetadata = e.data.data;
-        // Check if song changed BEFORE updating metadata
-        const songChanged = newMetadata.name !== metadata.name ||
-                           newMetadata.singer !== metadata.singer ||
-                           newMetadata.albumName !== metadata.albumName;
-
-        metadata = newMetadata;
-
-        if (songChanged) {
-          onSongChange();
-        }
-
-        isRefreshing = false;
-      } else if (e.data.type === "error") {
-        console.error("Failed to fetch metadata:", e.data.error);
-        isRefreshing = false;
-      }
-    };
-
+  onMount(async () => {
     fetchMetadata();
-    if (!eventSource) {
-      connectSSE();
-    }
+    lastCall = Date.now();
   });
 
   onDestroy(() => {
@@ -126,18 +89,22 @@
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
     }
-    if (metadataWorker) {
-      metadataWorker.terminate();
-    }
   });
 
-  function fetchMetadata() {
-    if (isRefreshing || !metadataWorker) return;
-    isRefreshing = true;
-    metadataWorker.postMessage({ type: "fetch" });
+  async function fetchMetadata() {
+    if (Date.now() - lastCall >= 1000) {
+      lastCall = Date.now();
+      const INFO_URL = "/info";
+      const response = await fetch(INFO_URL);
+      metadata = await response.json();
+      if (!eventSource) {
+        connectSSE();
+      }
+    }
   }
 
   function connectSSE() {
+    const STATUS_URL = "/status";
     eventSource = new EventSource(STATUS_URL);
     eventSource.onopen = () => {
       if (reconnectTimer) {
@@ -149,17 +116,8 @@
     for (const eventType of ["progress", "status", "name", "singer", "albumName"]) {
       eventSource.addEventListener(eventType, (event: MessageEvent) => {
         if (eventType === "progress") {
-          const progress = parseFloat(event.data);
-          playerProgress = progress;
-          if (metadata.duration > 0 && progress >= metadata.duration) {
-            setTimeout(() => fetchMetadata(), 200);
-          }
-        } else {
-          // Trigger onSongChange immediately for song changes
-          onSongChange();
-          // Fetch metadata after 200ms delay to give API time to be ready
-          setTimeout(() => fetchMetadata(), 200);
-        }
+          playerProgress = parseFloat(event.data);
+        } else setTimeout(async () => fetchMetadata(), 500);
       });
     }
 

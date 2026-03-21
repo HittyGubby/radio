@@ -46,13 +46,6 @@ pub fn enumerate_devices() -> Result<Vec<AudioDevice>> {
                 None => return,
             };
 
-            // Filter: Only accept Audio/Source class
-            // Reject: Audio/Sink, Video/*, Stream/*
-            // if media_class != "Audio/Source" {
-            //    log::debug!("Skipping device with class: {}", media_class);
-            //    return;
-            // }
-
             let id = global.id;
             let name = props
                 .get("node.name")

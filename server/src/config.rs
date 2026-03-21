@@ -265,10 +265,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn audio_frame_samples(&self) -> usize {
-        (self.output_sample_rate as usize * self.audio_frame_ms) / 1000
-    }
-
     pub fn spectro_frame_samples(&self) -> usize {
         (self.input_sample_rate as usize * self.spectro_frame_ms) / 1000
     }
@@ -300,14 +296,7 @@ impl Config {
             if config_path.exists() {
                 log::info!("Loading config from: {:?}", config_path);
                 match Self::load_from_file(&config_path) {
-                    Ok(loaded_config) => {
-                        log::info!(
-                            "Successfully loaded config file - device_name: {:?}, device_id: {:?}",
-                            loaded_config.device_name,
-                            loaded_config.device_id
-                        );
-                        loaded_config
-                    }
+                    Ok(loaded_config) => loaded_config,
                     Err(e) => {
                         log::warn!("Failed to load config file: {}, using defaults", e);
                         Self::default_config()
@@ -327,12 +316,6 @@ impl Config {
 
         // Then parse CLI args to override config file values
         let cli_args = Self::parse();
-
-        log::info!(
-            "CLI args parsed - device_name: {:?}, device_id: {:?}",
-            cli_args.device_name,
-            cli_args.device_id
-        );
 
         // Override with CLI args (only non-None values)
         if cli_args.list_devices {

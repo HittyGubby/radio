@@ -44,6 +44,7 @@ spectro_frame_ms = 60
 # - Window function options: hann, hamming, blackman
 # - spectro_fft_size must be a power of 2 (256, 512, 1024, 2048, 4096, 8192, etc.)
 # - spectro_max_freq cannot exceed input_sample_rate / 2 (Nyquist frequency)
-# - input_sample_rate: Sample rate for audio capture and spectrogram
+# - input_sample_rate: Sample rate for spectrogram capture (high rate for better frequency resolution)
 # - output_sample_rate: Sample rate for encoded audio transmission (lower = less bandwidth)
+#   PipeWire automatically handles high-quality resampling between input and output rates
 # - audio_frame_ms: Frame duration in milliseconds (opus: 2.5, 5, 10, 20, 40, 60; pcm: any)

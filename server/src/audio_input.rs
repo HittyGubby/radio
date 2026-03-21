@@ -20,7 +20,18 @@ impl Drop for PipeWireCapture {
 pub async fn start_audio_capture(
     config: &Config,
     audio_tx: tokio::sync::broadcast::Sender<Vec<f32>>,
+    use_input_rate: bool,
 ) -> Result<PipeWireCapture> {
+    let sample_rate = if use_input_rate {
+        config.get_input_sample_rate()
+    } else {
+        config.get_output_sample_rate()
+    };
+    info!(
+        "Starting audio capture at sample_rate={} (use_input_rate={})",
+        sample_rate, use_input_rate
+    );
+
     let devices = list_audio_devices()
         .await
         .context("Failed to list audio devices")?;
@@ -66,16 +77,16 @@ pub async fn start_audio_capture(
                 .global(|_global| {})
                 .register();
 
+            let node_name = format!("radio-capture-{}", sample_rate);
             let stream_props = properties! {
                 *pw::keys::MEDIA_TYPE => "Audio",
                 *pw::keys::MEDIA_CATEGORY => "Capture",
                 *pw::keys::MEDIA_ROLE => "Music",
-                *pw::keys::NODE_NAME => "radio-capture",
+                *pw::keys::NODE_NAME => node_name.as_str(),
                 *pw::keys::NODE_AUTOCONNECT => "true",
                 *pw::keys::AUDIO_CHANNELS => "2",
             };
-
-            let stream = pw::stream::Stream::new(&core, "radio-capture", stream_props)
+            let stream = pw::stream::Stream::new(&core, node_name.as_str(), stream_props)
                 .expect("Failed to create PipeWire stream");
 
             let audio_tx = Arc::new(audio_tx);
@@ -144,11 +155,17 @@ pub async fn start_audio_capture(
                                         sample_slice.to_vec()
                                     };
 
-                                    let _ = audio_tx_clone.send(mono_samples);
-                                    samples_written_clone.fetch_add(
-                                        samples as u64,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    match audio_tx_clone.send(mono_samples) {
+                                        Ok(_) => {
+                                            let _total = samples_written_clone.fetch_add(
+                                                samples as u64,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::error!("Failed to send audio samples: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -158,10 +175,9 @@ pub async fn start_audio_capture(
 
             let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
             audio_info.set_format(pw::spa::param::audio::AudioFormat::F32LE);
-            audio_info.set_rate(config.get_input_sample_rate());
+            audio_info.set_rate(sample_rate);
             audio_info.set_channels(config.channels as u32);
 
-            // Set channel positions based on configuration
             let mut pos = [0u32; 64];
             if config.channels == 2 {
                 // Stereo

@@ -10,10 +10,8 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-/// Config sent to frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendConfig {
     pub output_sample_rate: u32,
@@ -28,14 +26,14 @@ impl From<&Config> for FrontendConfig {
         // Calculate actual max frequency based on input sample rate
         let input_sample_rate = config.get_input_sample_rate();
         let nyquist_freq = input_sample_rate / 2;
-        let actual_max_freq = config.spectro_max_freq.min(nyquist_freq);
+        let max_freq = config.spectro_max_freq.min(nyquist_freq);
 
         Self {
             output_sample_rate: config.get_output_sample_rate(),
             audio_bitrate: config.audio_bitrate,
             jitter_buffer_ms: config.jitter_buffer_ms,
             input_sample_rate: config.get_input_sample_rate(),
-            spectro_max_freq: actual_max_freq,
+            spectro_max_freq: max_freq,
         }
     }
 }
@@ -59,61 +57,6 @@ async fn handle_http_request(
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
             .unwrap())
-    }
-}
-
-pub struct AudioHistory {
-    packets: Vec<AudioPacket>,
-    max_duration_samples: usize,
-}
-
-impl AudioHistory {
-    pub fn new(sample_rate: u32, duration_seconds: usize) -> Self {
-        Self {
-            packets: Vec::new(),
-            max_duration_samples: sample_rate as usize * duration_seconds,
-        }
-    }
-
-    pub fn add(&mut self, packet: AudioPacket, frame_samples: usize) {
-        self.packets.push(packet);
-
-        let total_samples = self.packets.len() * frame_samples;
-        if total_samples > self.max_duration_samples {
-            let to_remove = (total_samples - self.max_duration_samples) / frame_samples + 1;
-            self.packets.drain(0..to_remove.min(self.packets.len()));
-        }
-    }
-
-    pub fn get_all(&self) -> &[AudioPacket] {
-        &self.packets
-    }
-}
-
-pub struct SpectroHistory {
-    packets: Vec<crate::spectrogram_ws::SpectrogramPacket>,
-    max_duration_frames: usize,
-}
-
-impl SpectroHistory {
-    pub fn new(max_duration_frames: usize) -> Self {
-        Self {
-            packets: Vec::new(),
-            max_duration_frames,
-        }
-    }
-
-    pub fn add(&mut self, packet: crate::spectrogram_ws::SpectrogramPacket) {
-        self.packets.push(packet);
-
-        if self.packets.len() > self.max_duration_frames {
-            let to_remove = self.packets.len() - self.max_duration_frames;
-            self.packets.drain(0..to_remove);
-        }
-    }
-
-    pub fn get_all(&self) -> &[crate::spectrogram_ws::SpectrogramPacket] {
-        &self.packets
     }
 }
 
@@ -175,19 +118,7 @@ async fn handle_spectro_client(
     mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     mut rx: broadcast::Receiver<crate::spectrogram_ws::SpectrogramPacket>,
     client_count: Arc<AtomicUsize>,
-    spectro_history: Option<Arc<Mutex<SpectroHistory>>>,
 ) {
-    // // Send historical frames on initial connection
-    // if let Some(history) = spectro_history {
-    //     let history_packets = history.lock().await.get_all().to_vec();
-    //     for packet in &history_packets {
-    //         let data = packet.to_bytes();
-    //         if let Err(_e) = ws.send(Message::Binary(data)).await {
-    //             return;
-    //         }
-    //     }
-    // }
-
     loop {
         tokio::select! {
             result = rx.recv() => {
@@ -227,34 +158,30 @@ async fn handle_spectro_client(
 
     client_count.fetch_sub(1, Ordering::Relaxed);
     let current_clients = client_count.load(Ordering::Relaxed);
-    info!("Client disconnected: spectrogram (total: {})", current_clients);
+    info!(
+        "Client disconnected: spectrogram (total: {})",
+        current_clients
+    );
 }
 
 pub async fn run_ws_server(
     config: Config,
     audio_rx: broadcast::Receiver<AudioPacket>,
-    audio_history: Arc<Mutex<AudioHistory>>,
     shutdown: Arc<tokio::sync::Notify>,
     client_count: Arc<AtomicUsize>,
     spectro_rx: Option<broadcast::Receiver<crate::spectrogram_ws::SpectrogramPacket>>,
     spectro_client_count: Option<Arc<AtomicUsize>>,
-    spectro_history: Option<Arc<Mutex<SpectroHistory>>>,
 ) -> anyhow::Result<()> {
     info!("Starting WebSocket server on {}", config.ws_bind);
-    log::info!("WebSocket server task started");
-
-    log::info!("Attempting to bind listener to {}", config.ws_bind);
-    let listener = tokio::net::TcpListener::bind(&config.ws_bind).await.map_err(|e| {
-        log::error!("Failed to bind listener to {}: {}", config.ws_bind, e);
-        e
-    })?;
-    info!("WebSocket listener bound successfully");
-
-    log::info!("Entering WebSocket server loop");
+    let listener = tokio::net::TcpListener::bind(&config.ws_bind)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to bind listener to {}: {}", config.ws_bind, e);
+            e
+        })?;
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
-                info!("WebSocket server received shutdown signal");
                 return Ok(());
             }
             result = listener.accept() => {
@@ -265,11 +192,9 @@ pub async fn run_ws_server(
                         let spectro_path = config.spectro_path.clone();
                         let config_clone = config.clone();
                         let audio_rx_clone = audio_rx.resubscribe();
-                        let audio_history_clone = audio_history.clone();
                         let client_count_clone = client_count.clone();
                         let spectro_rx_clone = spectro_rx.as_ref().map(|rx| rx.resubscribe());
                         let spectro_client_count_clone = spectro_client_count.as_ref().cloned();
-                        let spectro_history_clone = spectro_history.clone();
 
                         tokio::spawn(async move {
                             let mut peek_buf = [0u8; 2048];
@@ -349,8 +274,7 @@ pub async fn run_ws_server(
                                 handle_spectro_client(
                                     ws,
                                     spectro_rx_clone.unwrap(),
-                                    client_count,
-                                    spectro_history_clone,
+                                    client_count
                                 ).await;
                             } else if path == audio_path {
                                 let (path_tx, path_rx) = tokio::sync::oneshot::channel();
@@ -382,13 +306,6 @@ pub async fn run_ws_server(
                                 let current_clients = client_count_clone.load(Ordering::Relaxed);
                                 info!("Client connected: {} (total: {})", ws_path, current_clients);
 
-                                let history = audio_history_clone.lock().await.get_all().to_vec();
-                                for packet in &history {
-                                    let data = serialize_audio_packet(packet);
-                                    if let Err(_e) = ws.send(Message::Binary(data)).await {
-                                        return;
-                                    }
-                                }
                                 handle_client(ws, audio_rx_clone, client_count_clone).await;
                             }
                         });

@@ -30,12 +30,6 @@
   let updateInterval: number = 50;
   let floatingLyricsComponent: any;
 
-  function handleSongChange() {
-    if (floatingLyricsComponent) {
-      floatingLyricsComponent.resetScroll();
-    }
-  }
-
   function handleAudioContextReady(context: AudioContext) {
     audioContext = context;
   }
@@ -59,7 +53,7 @@
 <main>
   <SpectrogramDrawer />
   <AudioPlayer bind:this={audioPlayerComponent} on:audioContextReady={(e) => handleAudioContextReady(e.detail)} />
-  <Metadata bind:metadata bind:playerProgress onSongChange={handleSongChange} />
+  <Metadata bind:metadata bind:playerProgress />
 
   {#if !isMobile}
     <FloatingLyrics bind:this={floatingLyricsComponent} {metadata} {playerProgress} />

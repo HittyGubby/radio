@@ -174,7 +174,6 @@
       const newLength = currentLength + chunk.length;
 
       if (newLength > maxBufferSize) {
-        // Buffer is too large, drop oldest samples
         const keepLength = Math.floor(maxBufferSize * 0.75);
         const droppedSamples = currentLength - keepLength;
         const newBuffer = new Float32Array(keepLength + chunk.length);

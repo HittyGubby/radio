@@ -14,8 +14,7 @@ pub struct AudioEncoder {
     encoder: Option<Encoder>,
     sample_index: u64,
     config: Config,
-    input_buffer: Vec<f32>,
-    input_sample_index: f64,
+    buffer: Vec<f32>,
 }
 
 impl AudioEncoder {
@@ -30,13 +29,16 @@ impl AudioEncoder {
             encoder,
             sample_index: 0,
             config: config.clone(),
-            input_buffer: Vec::new(),
-            input_sample_index: 0.0,
+            buffer: Vec::new(),
         })
     }
 
     fn create_opus_encoder(config: &Config) -> anyhow::Result<Encoder> {
-        let mut encoder = Encoder::new(config.get_output_sample_rate(), Channels::Mono, Application::Audio)?;
+        let mut encoder = Encoder::new(
+            config.get_input_sample_rate(),
+            Channels::Mono,
+            Application::Audio,
+        )?;
 
         encoder.set_bitrate(opus::Bitrate::Bits(config.audio_bitrate as i32))?;
         encoder.set_complexity(10)?;
@@ -45,61 +47,17 @@ impl AudioEncoder {
     }
 
     pub fn encode(&mut self, samples: &[f32]) -> Option<AudioPacket> {
-        let frame_samples = self.config.audio_frame_samples();
+        let frame_samples =
+            (self.config.get_input_sample_rate() as usize * self.config.audio_frame_ms) / 1000;
 
         if samples.is_empty() {
             return None;
         }
-
-        // Resample from input_sample_rate to output_sample_rate
-        let input_rate = self.config.get_input_sample_rate() as f64;
-        let output_rate = self.config.get_output_sample_rate() as f64;
-        let ratio = input_rate / output_rate;
-
-        // Add input samples to buffer
-        self.input_buffer.extend_from_slice(samples);
-
-        // Calculate how many output samples we can produce
-        let output_samples_count = ((self.input_buffer.len() as f64 - 1.0) / ratio).floor() as usize;
-
-        if output_samples_count == 0 {
+        self.buffer.extend_from_slice(samples);
+        if self.buffer.len() < frame_samples {
             return None;
         }
-
-        // Resample and collect output samples
-        let mut output_samples = Vec::with_capacity(output_samples_count);
-
-        for _ in 0..output_samples_count {
-            let position = self.input_sample_index;
-            let index_float = position.floor();
-            let index = index_float as usize;
-            let fraction = (position - index_float) as f32;
-
-            if index + 1 < self.input_buffer.len() {
-                let sample = self.input_buffer[index] * (1.0 - fraction)
-                    + self.input_buffer[index + 1] * fraction;
-                output_samples.push(sample);
-            } else {
-                output_samples.push(0.0);
-            }
-
-            self.input_sample_index += ratio;
-        }
-
-        // Remove used samples from buffer
-        let used_samples = self.input_sample_index.ceil() as usize;
-        if used_samples > 0 && used_samples <= self.input_buffer.len() {
-            self.input_buffer.drain(0..used_samples);
-            self.input_sample_index -= used_samples as f64;
-        }
-
-        // Check if we have enough samples for a frame
-        if output_samples.len() < frame_samples {
-            return None;
-        }
-
-        // Take exactly frame_samples from the output
-        let frame: Vec<f32> = output_samples.drain(0..frame_samples).collect();
+        let frame: Vec<f32> = self.buffer.drain(0..frame_samples).collect();
 
         let payload = if let Some(encoder) = &mut self.encoder {
             let mut output = vec![0u8; 4000];
@@ -157,18 +115,16 @@ pub async fn run_encoder(
     client_count: Arc<std::sync::atomic::AtomicUsize>,
 ) -> anyhow::Result<()> {
     let mut encoder = AudioEncoder::new(&config)?;
-    let frame_samples = config.audio_frame_samples();
-
-    // Calculate how many input samples we need to produce one output frame
-    let input_rate = config.get_input_sample_rate() as f64;
-    let output_rate = config.get_output_sample_rate() as f64;
-    let ratio = input_rate / output_rate;
-    let input_samples_per_frame = (frame_samples as f64 * ratio).ceil() as usize;
+    let frame_samples = (config.get_input_sample_rate() as usize * config.audio_frame_ms) / 1000;
 
     let mut internal_buffer: Vec<f32> = Vec::new();
 
-    log::info!("Encoder started - input_rate={}, output_rate={}, ratio={}, input_samples_per_frame={}, output_frame_samples={}",
-        config.get_input_sample_rate(), config.get_output_sample_rate(), ratio, input_samples_per_frame, frame_samples);
+    log::info!(
+        "Encoder started - input_rate={}, output_rate={}, frame_samples={}",
+        config.get_input_sample_rate(),
+        config.get_output_sample_rate(),
+        frame_samples
+    );
 
     loop {
         tokio::select! {
@@ -180,14 +136,16 @@ pub async fn run_encoder(
                 if clients == 0 {
                     if let Ok(_) = result {
                         internal_buffer.clear();
-                        encoder.input_buffer.clear();
+                        encoder.buffer.clear();
                     }
                     continue;
                 }
 
                 match result {
                     Ok(samples_vec) => {
-                        internal_buffer.extend_from_slice(&samples_vec);
+                        if !samples_vec.is_empty() {
+                            internal_buffer.extend_from_slice(&samples_vec);
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         warn!("Encoder lagged, dropping {} sample chunks", count);
@@ -197,11 +155,15 @@ pub async fn run_encoder(
                     }
                 }
 
-                // Process in chunks that can produce output frames
-                while internal_buffer.len() >= input_samples_per_frame {
-                    let frame: Vec<f32> = internal_buffer.drain(0..input_samples_per_frame).collect();
+                while internal_buffer.len() >= frame_samples {
+                    let frame: Vec<f32> = internal_buffer.drain(0..frame_samples).collect();
                     if let Some(packet) = encoder.encode(&frame) {
-                        let _ = sender.send(packet);
+                        // Don't send packets when idle - only send if payload has meaningful size
+                        // For typical Opus: meaningful packets are >= 10 bytes
+                        // For PCM: meaningful packets are full frame size (not just zeros)
+                        if packet.payload.len() >= 10 {
+                            let _ = sender.send(packet);
+                        }
                     }
                 }
             }
